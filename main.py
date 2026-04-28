@@ -17,25 +17,40 @@ import librosa
 import numpy as np
 from scipy.io import wavfile
 import torch
-from transformers import AutoModelForCTC, AutoProcessor
 import gc
 import re
 import pyworld as pw
-import pykakasi
+import pyopenjtalk
+import jaconv
 
 # PyannoteのReproducibilityWarning (TF32関連) を抑制
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
-# pykakasiの初期化（漢字・カタカナ・ローマ字 -> ひらがな）
-kks = pykakasi.kakasi()
-
-# 漢字・カタカナ等をひらがなに変換する関数
-def text_to_hiragana(text):
-    if not text:
-        return text
-    result = kks.convert(text)
-    return "".join([item['hira'] for item in result])
+# 漢字・カタカナ等をひらがなのモーラに分割する関数
+def get_word_moras(text):
+    """pyopenjtalkとjaconvを用いてテキストをひらがなのモーラ（文字）リストに変換する"""
+    if not text or text.strip() == "":
+        return []
+    
+    try:
+        features = pyopenjtalk.run_frontend(text)
+        prons = []
+        for f in features:
+            pron = f.get('pron', '')
+            if pron and pron != '*':
+                prons.append(pron)
+        
+        if not prons:
+            prons = [text]
+            
+        kata_str = "".join(prons)
+        hira_str = jaconv.kata2hira(kata_str)
+        return list(hira_str)
+    except Exception as e:
+        print(f"pyopenjtalk変換エラー: {e}")
+        # フォールバックとして元の文字列を文字ごとに分割して返す
+        return list(text)
 
 # 日本語文字から母音を判定するためのマッピング
 def get_vowel(text):
@@ -81,75 +96,78 @@ def get_vowel(text):
     return vowel_table.get(char, "あ")
 
 # ==========================================
-# 1. Wav2Vec2で文字レベルのタイムスタンプを取得
+# 1. Qwen3-ASRとForcedAlignerで高精度なタイムスタンプを取得
 # ==========================================
-def get_wav2vec2_lyrics(audio_path):
-    print("Wav2Vec2で音声認識とタイムスタンプの取得を実行中...")
+def get_qwen3_lyrics_and_alignment(audio_path):
+    print("Qwen3-ASR-1.7BとQwen3-ForcedAligner-0.6Bで音声認識とアライメントを実行中...")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"使用デバイス: {device}")
 
-    model_id = "jonatasgrosman/wav2vec2-large-xlsr-53-japanese"
-    processor = AutoProcessor.from_pretrained(model_id)
-    model = AutoModelForCTC.from_pretrained(model_id).to(device)
+    try:
+        from qwen_asr.inference.qwen3_asr import Qwen3ASRModel
+    except ImportError as e:
+        print(f"qwen_asrライブラリのインポートに失敗しました。仮想環境の設定を確認してください: {e}")
+        return []
 
-    # 音声の読み込みと16kHzへのリサンプリング
-    audio, sr = torchaudio.load(audio_path)
-    if audio.shape[0] > 1:
-        audio = audio.mean(dim=0, keepdim=True)
-    if sr != 16000:
-        resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=16000)
-        audio = resampler(audio)
-        sr = 16000
-    
-    input_values = processor(audio.squeeze().numpy(), return_tensors="pt", sampling_rate=sr).input_values.to(device)
-    
-    with torch.no_grad():
-        logits = model(input_values).logits
+    # モデルのロード (ASR + Forced Aligner)
+    try:
+        model = Qwen3ASRModel.from_pretrained(
+            "Qwen/Qwen3-ASR-1.7B", 
+            trust_remote_code=True,
+            device_map=device,
+            forced_aligner="Qwen/Qwen3-ForcedAligner-0.6B",
+            forced_aligner_kwargs={"trust_remote_code": True, "device_map": device}
+        )
+    except Exception as e:
+        print(f"モデルのロード中にエラーが発生しました: {e}")
+        print("一時的な回避策として、HuggingFaceの接続やtransformersのバージョンを確認してください。")
+        return []
 
-    # トークンの予測 (フレーム単位)
-    predicted_ids = torch.argmax(logits, dim=-1)[0]
+    # 推論とアライメントの実行
+    print("推論を開始します。これには少し時間がかかる場合があります。")
+    res = model.transcribe(audio_path, language="Japanese", return_time_stamps=True)
     
-    # トークンの情報を抽出
+    if not res or len(res) == 0:
+        print("音声認識結果が得られませんでした。")
+        return []
+
+    transcription = res[0]
+    print(f"認識されたテキスト: {transcription.text}")
+
     char_segments = []
-    current_char_id = None
-    start_frame = 0
     
-    # タイムスタンプ計算用
-    num_frames = len(predicted_ids)
-    audio_duration = audio.shape[1] / sr
-    time_per_frame = audio_duration / num_frames
+    if not transcription.time_stamps or not hasattr(transcription.time_stamps, 'items'):
+        print("警告: アライメント情報が取得できませんでした。")
+        return []
 
-    # CTCのデコード処理 (連続する同トークンのマージとブランクの除去)
-    for i, token_id in enumerate(predicted_ids):
-        # 連続する同じトークンをまとめる
-        if token_id != current_char_id:
-            if current_char_id is not None:
-                # pad_token_id や blank_token_id を除外
-                if current_char_id != processor.tokenizer.pad_token_id:
-                    char_text = processor.decode([current_char_id])
-                    if char_text.strip():
-                        char_segments.append({
-                            "text": text_to_hiragana(char_text),
-                            "start": start_frame * time_per_frame,
-                            "end": i * time_per_frame
-                        })
-            current_char_id = token_id
-            start_frame = i
+    # ForcedAlignItem (text, start_time, end_time) からUST用の文字単位セグメントを構築
+    for item in transcription.time_stamps.items:
+        word_text = item.text
+        start_t = float(item.start_time)
+        end_t = float(item.end_time)
+        
+        # 読み仮名を取得し、文字（モーラ）単位に分割
+        moras = get_word_moras(word_text)
+        num_moras = len(moras)
+        
+        if num_moras == 0:
+            continue
             
-    # 最後のトークンの処理
-    if current_char_id is not None:
-        if current_char_id != processor.tokenizer.pad_token_id:
-            char_text = processor.decode([current_char_id])
-            if char_text.strip():
-                char_segments.append({
-                    "text": text_to_hiragana(char_text),
-                    "start": start_frame * time_per_frame,
-                    "end": num_frames * time_per_frame
-                })
+        # 1つの単語/文字の時間を、含まれるモーラ数で均等に分割する
+        duration_per_mora = (end_t - start_t) / num_moras
+        
+        for i, mora in enumerate(moras):
+            mora_start = start_t + i * duration_per_mora
+            mora_end = start_t + (i + 1) * duration_per_mora
+            
+            char_segments.append({
+                "text": mora,
+                "start": mora_start,
+                "end": mora_end
+            })
 
     # メモリ解放
     del model
-    del processor
     if device == "cuda":
         torch.cuda.empty_cache()
     gc.collect()
@@ -410,8 +428,8 @@ if __name__ == "__main__":
     audio_file = "vocal.wav"
     output_ust = "output_hybrid.ust"
     
-    # 1. Wav2Vec2で文字と時間を取得（絶対的な時間軸の固定）
-    char_segments = get_wav2vec2_lyrics(audio_file)
+    # 1. Qwen3を用いた高精度音声認識および強制アライメント
+    char_segments = get_qwen3_lyrics_and_alignment(audio_file)
     
     # 2. pyworldで10msごとのピッチ推移を取得
     time_array, midi_contour, confidence_array = get_pyworld_pitch_contour(audio_file)
@@ -420,8 +438,8 @@ if __name__ == "__main__":
     final_notes = segment_and_align_notes(char_segments, time_array, midi_contour, confidence_array)
     
     # 4. 確認表示
-    for note in final_notes:
-        print(f"[{note['start']:.2f}s - {note['end']:.2f}s] {note['text']} (MIDI: {note['pitch']})")
+    # for note in final_notes:
+    #     print(f"[{note['start']:.2f}s - {note['end']:.2f}s] {note['text']} (MIDI: {note['pitch']})")
     
     # 5. USTファイルとして保存
     export_to_ust(final_notes, output_ust)
