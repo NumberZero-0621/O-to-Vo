@@ -1,0 +1,5 @@
+{
+    "python.defaultInterpreterPath": ".venv/Scripts/python.exe",
+    "python.terminal.activateEnvInSelectedTerminal": true,
+    "python.useEnvironmentsExtension": false
+}
