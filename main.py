@@ -22,6 +22,8 @@ import re
 import pyworld as pw
 import pyopenjtalk
 import jaconv
+import whisperx
+from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
 
 # PyannoteのReproducibilityWarning (TF32関連) を抑制
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -46,11 +48,17 @@ def get_word_moras(text):
             
         kata_str = "".join(prons)
         hira_str = jaconv.kata2hira(kata_str)
-        return list(hira_str)
+        
+        # 除外対象文字のフィルタリング (ユーザー要望: ’、っ 等)
+        exclude_chars = "’、っ。！?？（）() 　.,'\"-"
+        moras = [c for c in hira_str if c not in exclude_chars]
+        
+        return moras
     except Exception as e:
         print(f"pyopenjtalk変換エラー: {e}")
         # フォールバックとして元の文字列を文字ごとに分割して返す
-        return list(text)
+        exclude_chars = "’、っ。！?？（）() 　.,'\"-"
+        return [c for c in text if c not in exclude_chars]
 
 # 日本語文字から母音を判定するためのマッピング
 def get_vowel(text):
@@ -95,83 +103,167 @@ def get_vowel(text):
     }
     return vowel_table.get(char, "あ")
 
+def group_into_moras(chars):
+    """文字リストをUTAUのノート単位（モーラ）にまとめる。きゃ、じゃ等の拗音に対応。"""
+    small_chars = "ぁぃぅぇぉゃゅょゎァィゥェォャュョヮ"
+    moras = []
+    for char in chars:
+        if char in small_chars and moras:
+            moras[-1] += char
+        else:
+            moras.append(char)
+    return moras
+
 # ==========================================
-# 1. Qwen3-ASRとForcedAlignerで高精度なタイムスタンプを取得
+# 1. WhisperXで高精度なタイムスタンプを取得
 # ==========================================
-def get_qwen3_lyrics_and_alignment(audio_path):
-    print("Qwen3-ASR-1.7BとQwen3-ForcedAligner-0.6Bで音声認識とアライメントを実行中...")
+def load_whisperx_models():
+    print("WhisperXモデルをロード中...")
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"使用デバイス: {device}")
+    compute_type = "float16" if device == "cuda" else "int8"
+    print(f"使用デバイス: {device} ({compute_type})")
 
-    try:
-        from qwen_asr.inference.qwen3_asr import Qwen3ASRModel
-    except ImportError as e:
-        print(f"qwen_asrライブラリのインポートに失敗しました。仮想環境の設定を確認してください: {e}")
-        return []
+    model = whisperx.load_model("large-v3", device, compute_type=compute_type, language="ja")
+    model_a, metadata = whisperx.load_align_model(language_code="ja", device=device, model_name="vumichien/wav2vec2-large-xlsr-japanese-hiragana")
+    
+    return model, model_a, metadata, device
 
-    # モデルのロード (ASR + Forced Aligner)
+def process_whisperx_chunk(audio_path, model, model_a, metadata, device, offset_seconds=0.0):
+    audio = whisperx.load_audio(audio_path)
+    
     try:
-        model = Qwen3ASRModel.from_pretrained(
-            "Qwen/Qwen3-ASR-1.7B", 
-            trust_remote_code=True,
-            device_map=device,
-            forced_aligner="Qwen/Qwen3-ForcedAligner-0.6B",
-            forced_aligner_kwargs={"trust_remote_code": True, "device_map": device}
-        )
+        result = model.transcribe(audio, batch_size=4)
     except Exception as e:
-        print(f"モデルのロード中にエラーが発生しました: {e}")
-        print("一時的な回避策として、HuggingFaceの接続やtransformersのバージョンを確認してください。")
+        print(f"transcribeエラー: {e}")
         return []
 
-    # 推論とアライメントの実行
-    print("推論を開始します。これには少し時間がかかる場合があります。")
-    res = model.transcribe(audio_path, language="Japanese", return_time_stamps=True)
+    hallucination_keywords = ["ご視聴ありがとうございました", "ごしちょーありがとーございました", "チャンネル登録", "お借りした素材"]
+    valid_segments = []
     
-    if not res or len(res) == 0:
-        print("音声認識結果が得られませんでした。")
-        return []
-
-    transcription = res[0]
-    print(f"認識されたテキスト: {transcription.text}")
-
-    char_segments = []
-    
-    if not transcription.time_stamps or not hasattr(transcription.time_stamps, 'items'):
-        print("警告: アライメント情報が取得できませんでした。")
-        return []
-
-    # ForcedAlignItem (text, start_time, end_time) からUST用の文字単位セグメントを構築
-    for item in transcription.time_stamps.items:
-        word_text = item.text
-        start_t = float(item.start_time)
-        end_t = float(item.end_time)
+    for segment in result["segments"]:
+        text = segment["text"]
+        # ハルシネーションチェック（元のテキストでチェック）
+        is_hallu = False
+        for kw in hallucination_keywords:
+            if kw in text:
+                is_hallu = True
+                break
         
-        # 読み仮名を取得し、文字（モーラ）単位に分割
-        moras = get_word_moras(word_text)
-        num_moras = len(moras)
-        
-        if num_moras == 0:
+        if is_hallu:
+            print(f"  [ハルシネーション除外] {text}")
             continue
             
-        # 1つの単語/文字の時間を、含まれるモーラ数で均等に分割する
-        duration_per_mora = (end_t - start_t) / num_moras
+        moras = get_word_moras(text)
+        hira_text = "".join(moras)
         
-        for i, mora in enumerate(moras):
-            mora_start = start_t + i * duration_per_mora
-            mora_end = start_t + (i + 1) * duration_per_mora
-            
+        # ひらがな化後のテキストでもチェック
+        for kw in hallucination_keywords:
+            if kw in hira_text:
+                is_hallu = True
+                break
+        
+        if is_hallu:
+            print(f"  [ハルシネーション除外] {hira_text}")
+            continue
+
+        segment["text"] = hira_text
+        valid_segments.append(segment)
+
+    result["segments"] = valid_segments
+
+    if not result["segments"]:
+        return []
+
+    try:
+        result = whisperx.align(result["segments"], model_a, metadata, audio, device, return_char_alignments=True)
+    except Exception as e:
+        print(f"alignエラー: {e}")
+        return []
+        
+    char_segments = []
+    
+    for segment in result["segments"]:
+        for char_info in segment.get("chars", []):
+            char_text = char_info.get("char", "")
+            if not char_text.strip():
+                continue
+            if "start" not in char_info or "end" not in char_info:
+                continue
+                
             char_segments.append({
-                "text": mora,
-                "start": mora_start,
-                "end": mora_end
+                "text": char_text,
+                "start": float(char_info["start"]) + offset_seconds,
+                "end": float(char_info["end"]) + offset_seconds
             })
 
-    # メモリ解放
-    del model
-    if device == "cuda":
-        torch.cuda.empty_cache()
-    gc.collect()
+    return char_segments
 
+# ==========================================
+# 1.5. Wav2Vec2の純粋なCTCデコード（デバッグ用）
+# ==========================================
+def load_wav2vec2_ctc_model():
+    print("Wav2Vec2(CTC)モデルをロード中...")
+    model_name = "vumichien/wav2vec2-large-xlsr-japanese-hiragana"
+    processor = Wav2Vec2Processor.from_pretrained(model_name)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = Wav2Vec2ForCTC.from_pretrained(model_name).to(device)
+    return model, processor, device
+
+def process_wav2vec2_ctc_chunk(audio_path, model, processor, device, offset_seconds=0.0):
+    audio, sr = librosa.load(audio_path, sr=16000)
+    inputs = processor(audio, sampling_rate=16000, return_tensors="pt", padding=True).to(device)
+    
+    with torch.no_grad():
+        logits = model(inputs.input_values).logits
+        
+    predicted_ids = torch.argmax(logits, dim=-1)[0].cpu().numpy()
+    
+    vocab = processor.tokenizer.get_vocab()
+    id_to_token = {v: k for k, v in vocab.items()}
+    
+    # vumichien/wav2vec2-large-xlsr-japanese-hiragana のストライドから計算したフレーム長は20ms
+    frame_duration = 0.02
+    
+    char_segments = []
+    current_char = None
+    start_frame = None
+    
+    for i, token_id in enumerate(predicted_ids):
+        token = id_to_token.get(token_id, "")
+        
+        # [PAD] (CTCのブランク)の処理
+        if token == "[PAD]":
+            if current_char is not None:
+                char_segments.append({
+                    "text": current_char,
+                    "start": start_frame * frame_duration + offset_seconds,
+                    "end": i * frame_duration + offset_seconds
+                })
+                current_char = None
+            continue
+            
+        # 文字が変わったか、ブランクの後に新しい文字が来た場合
+        if token != current_char:
+            if current_char is not None:
+                char_segments.append({
+                    "text": current_char,
+                    "start": start_frame * frame_duration + offset_seconds,
+                    "end": i * frame_duration + offset_seconds
+                })
+            current_char = token.replace('|', '')
+            start_frame = i
+
+    # 最後の文字
+    if current_char is not None:
+        char_segments.append({
+            "text": current_char,
+            "start": start_frame * frame_duration + offset_seconds,
+            "end": len(predicted_ids) * frame_duration + offset_seconds
+        })
+        
+    # 空白文字および除外対象文字を除去し、リストを返す
+    exclude_chars = "’、っ。！?？（）() 　.,'\"-"
+    char_segments = [s for s in char_segments if s["text"].strip() and s["text"] not in exclude_chars]
     return char_segments
 
 # ==========================================
@@ -229,9 +321,105 @@ def get_pyworld_pitch_contour(audio_path):
     return time, midi_contour, confidence
 
 # ==========================================
+# DPを用いたWhisperXとWav2Vec2の歌詞マッピング
+# ==========================================
+def align_lyrics_to_timings(whisper_chars, w2v2_chars):
+    if not w2v2_chars:
+        return []
+    if not whisper_chars:
+        return list(w2v2_chars)
+        
+    N = len(whisper_chars)
+    M = len(w2v2_chars)
+    
+    dp = np.full((N + 1, M + 1), float('inf'))
+    path = np.zeros((N + 1, M + 1), dtype=int)
+    
+    SKIP_B_COST = 0.5
+    SQUEEZE_A_COST = 2.0
+    MATCH_REWARD = -2.0
+    MISMATCH_PENALTY = 1.0
+    TIME_WEIGHT = 2.0
+    
+    dp[0][0] = 0.0
+    for j in range(1, M + 1):
+        dp[0][j] = dp[0][j-1] + SKIP_B_COST
+        path[0][j] = 1 # 1: Skip B
+        
+    for i in range(1, N + 1):
+        for j in range(1, M + 1):
+            a_mid = (whisper_chars[i-1]["start"] + whisper_chars[i-1]["end"]) / 2.0
+            b_mid = (w2v2_chars[j-1]["start"] + w2v2_chars[j-1]["end"]) / 2.0
+            tdiff = abs(a_mid - b_mid)
+            base_cost = tdiff * TIME_WEIGHT
+            
+            char_cost = MATCH_REWARD if whisper_chars[i-1]["text"] == w2v2_chars[j-1]["text"] else MISMATCH_PENALTY
+            
+            cost_match = dp[i-1][j-1] + base_cost + char_cost
+            cost_skip_b = dp[i][j-1] + SKIP_B_COST
+            cost_squeeze_a = dp[i-1][j] + base_cost + SQUEEZE_A_COST
+            
+            costs = [cost_match, cost_skip_b, cost_squeeze_a]
+            min_cost = min(costs)
+            dp[i][j] = min_cost
+            path[i][j] = costs.index(min_cost)
+            
+    i, j = N, M
+    b_assigned = {idx: [] for idx in range(M)}
+    b_skipped = [False] * M
+    
+    while i > 0 or j > 0:
+        p = path[i][j]
+        if p == 0: # Match
+            i -= 1
+            j -= 1
+            b_assigned[j].insert(0, whisper_chars[i]["text"])
+        elif p == 1: # Skip B
+            j -= 1
+            b_skipped[j] = True
+        elif p == 2: # Squeeze A
+            i -= 1
+            b_assigned[j-1].insert(0, whisper_chars[i]["text"])
+            
+    aligned_notes = []
+    for j in range(M):
+        seg_template = dict(w2v2_chars[j])
+        assigned_chars = b_assigned[j]
+        
+        if not assigned_chars:
+            if b_skipped[j]:
+                # 何も割り当てられなかった場合は元のWav2Vec2の結果を維持するか、スキップするか
+                # 現状は元のテキスト（またはR等）を維持
+                aligned_notes.append(seg_template)
+            else:
+                # 原理上ここには来ないはずだが念のため
+                aligned_notes.append(seg_template)
+            continue
+            
+        # 割り当てられた文字をモーラ（ノート単位）にまとめる
+        moras = group_into_moras(assigned_chars)
+        
+        if len(moras) > 1:
+            # 複数のモーラがある場合、セグメントを分割して個別のノートにする
+            total_duration = seg_template["end"] - seg_template["start"]
+            mora_duration = total_duration / len(moras)
+            for k, mora in enumerate(moras):
+                new_seg = dict(seg_template)
+                new_seg["text"] = mora
+                new_seg["start"] = seg_template["start"] + k * mora_duration
+                new_seg["end"] = seg_template["start"] + (k + 1) * mora_duration
+                aligned_notes.append(new_seg)
+        else:
+            # 1つのモーラのみの場合
+            seg_template["text"] = moras[0] if moras else ""
+            aligned_notes.append(seg_template)
+        
+    return aligned_notes
+
+# ==========================================
 # 3. ノートの分割と文字の割り当て（ハイブリッド処理）
 # ==========================================
-def segment_and_align_notes(char_segments, time_array, midi_contour, confidence_array, min_duration=0.02):
+def segment_and_align_notes(char_segments, time_array, midi_contour, confidence_array, min_duration=0.03):
     print("統合タイムライン方式によるノート生成を実行中...")
     
     if len(time_array) == 0:
@@ -241,15 +429,8 @@ def segment_and_align_notes(char_segments, time_array, midi_contour, confidence_
     # 10ms単位の各スロットにどの文字が割り当てられているかを埋める
     timeline_texts = [None] * len(time_array)
     
-    # 開始時間でソート（後の文字を優先的に上書きするようにし、整合性を保つ）
+    # 開始時間でソート
     char_segments_sorted = sorted(char_segments, key=lambda x: x["start"])
-    
-    # Wav2Vec2の特性上、文字が極端に短く予測され残りが空白トークンになるため、
-    # 次の文字が始まるまで今の文字の長さを延長する（ギャップを埋める）
-    for i in range(len(char_segments_sorted) - 1):
-        char_segments_sorted[i]["end"] = char_segments_sorted[i+1]["start"]
-    if len(char_segments_sorted) > 0:
-        char_segments_sorted[-1]["end"] = max(char_segments_sorted[-1]["end"], char_segments_sorted[-1]["start"] + 2.0)
     
     for char_info in char_segments_sorted:
         # この文字の区間に対応するタイムラインのインデックス範囲を特定
@@ -258,6 +439,16 @@ def segment_and_align_notes(char_segments, time_array, midi_contour, confidence_
         for idx in range(start_idx, end_idx):
             if idx < len(timeline_texts):
                 timeline_texts[idx] = char_info["text"]
+
+    # ギャップ（Wav2Vec2で検出されなかった有声音区間）を「直前の文字」で埋める
+    # これにより、ピッチが同じであればWav2Vec2の検出タイミングと結合され、1つの長いノートになる
+    last_text = None
+    for i in range(len(timeline_texts)):
+        if timeline_texts[i] is not None:
+            last_text = timeline_texts[i]
+        else:
+            if last_text is not None and confidence_array[i] > 0:
+                timeline_texts[i] = last_text
 
     # 無音（休符）の判定
     # ピッチが取れなかった（無声音/無音）区間が一定時間以上続いた場合、Rest (None) にする
@@ -310,27 +501,33 @@ def segment_and_align_notes(char_segments, time_array, midi_contour, confidence_
         "pitch": current_midi if current_text else 60
     })
 
+    # 2.5 短いノートの統合（ノイズ除去）
+    # 歌詞が異なっていても、どちらかが短すぎる場合は統合する
+    merged_raw_notes = []
+    for note in raw_notes:
+        if not merged_raw_notes:
+            merged_raw_notes.append(dict(note))
+            continue
+            
+        last_note = merged_raw_notes[-1]
+        last_duration = last_note["end"] - last_note["start"]
+        duration = note["end"] - note["start"]
+        
+        # どちらかが短すぎる場合、統合する
+        if duration < min_duration or last_duration < min_duration:
+            # 長い方のノートの歌詞とピッチを優先する
+            if duration > last_duration:
+                last_note["lyric"] = note["lyric"]
+                last_note["pitch"] = note["pitch"]
+            last_note["end"] = note["end"]
+        else:
+            merged_raw_notes.append(dict(note))
+
     # 3. データの整形と「ー」の割当
     final_notes = []
     last_lyric_base = None
     
-    for note in raw_notes:
-        duration = note["end"] - note["start"]
-        
-        # フィルタリング:
-        # 1. 歌詞が同じで、現在のノートが短すぎる場合は前のノートに統合
-        # 2. 歌詞が同じで、前のノートが短すぎる（最小長さに満たない）場合も統合して長さを稼ぐ
-        # ただし、歌詞が変わった場合は、たとえ短くても統合せずに新しいノートとして開始する（発音の変化を優先）
-        if len(final_notes) > 0 and note["lyric"] == final_notes[-1]["original_text"]:
-            last_note = final_notes[-1]
-            last_duration = last_note["end"] - last_note["start"]
-            if duration < min_duration or last_duration < min_duration:
-                # 長い方のノートのピッチを優先する（しゃくりやビブラートの端点ではなく、本体のピッチを拾うため）
-                if duration > last_duration:
-                    last_note["pitch"] = note["pitch"]
-                last_note["end"] = note["end"]
-                continue
-            
+    for note in merged_raw_notes:
         lyric = note["lyric"]
         processed_lyric = lyric
         
@@ -350,6 +547,21 @@ def segment_and_align_notes(char_segments, time_array, midi_contour, confidence_
             "end": note["end"],
             "pitch": note["pitch"]
         })
+        
+    # 4. 極端な低音ノイズの削除（休符化）
+    # 直前の有効なノートより1.5オクターブ（18半音）以上低く、かつB2（47）以下のノートを休符（R）にする
+    last_valid_pitch = None
+    for note in final_notes:
+        if note["text"] == "R":
+            continue
+            
+        if last_valid_pitch is not None:
+            if note["pitch"] <= 47 and note["pitch"] <= last_valid_pitch - 18:
+                note["text"] = "R"
+                note["original_text"] = "R"
+                continue
+                
+        last_valid_pitch = note["pitch"]
         
     return final_notes
 
@@ -388,8 +600,22 @@ def export_to_ust(ust_notes, output_path, tempo=120):
 
             # 2. ノートの書き出し
             for i, note in enumerate(ust_notes):
-                # 絶対座標（ティック）を計算し、前との差分を Length とする
+                start_tick = int(round(note["start"] * ticks_per_second))
                 end_tick = int(round(note["end"] * ticks_per_second))
+                
+                # もし current_tick より start_tick が未来なら、休符を挿入する
+                if start_tick > current_tick:
+                    rest_length = start_tick - current_tick
+                    f.write(f"[#{str(note_idx).zfill(4)}]\n")
+                    f.write(f"Length={rest_length}\n")
+                    f.write("Lyric=R\n")
+                    f.write("NoteNum=60\n")
+                    f.write("PreUtterance=0\n")
+                    f.write("VoiceOverlap=0\n")
+                    note_idx += 1
+                    current_tick = start_tick
+                
+                # 絶対座標（ティック）を計算し、前との差分を Length とする
                 length_ticks = end_tick - current_tick
                 
                 # 重複や逆転を防止
@@ -427,20 +653,136 @@ def export_to_ust(ust_notes, output_path, tempo=120):
 if __name__ == "__main__":
     audio_file = "vocal.wav"
     output_ust = "output_hybrid.ust"
+    output_wav2vec2_ust = "output_wav2vec2.ust"  # デバッグ用出力
     
-    # 1. Qwen3を用いた高精度音声認識および強制アライメント
-    char_segments = get_qwen3_lyrics_and_alignment(audio_file)
+    if not os.path.exists(audio_file):
+        print(f"エラー: {audio_file} が見つかりません。")
+        exit(1)
+        
+    # モデルの事前ロード
+    model, model_a, metadata, device = load_whisperx_models()
+    model_w2v2, processor_w2v2, device_w2v2 = load_wav2vec2_ctc_model()
     
-    # 2. pyworldで10msごとのピッチ推移を取得
-    time_array, midi_contour, confidence_array = get_pyworld_pitch_contour(audio_file)
+    sr, full_audio = wavfile.read(audio_file)
+    # モノラル化
+    if len(full_audio.shape) > 1:
+        full_audio = np.mean(full_audio, axis=1).astype(full_audio.dtype)
+        
+    total_samples = len(full_audio)
     
-    # 3. データの結合（文字の時間枠内でピッチが動いたら分割する）
-    final_notes = segment_and_align_notes(char_segments, time_array, midi_contour, confidence_array)
+    # VADによるチャンク分割 (librosa.effects.splitを使用)
+    print("VADを用いて無音区間で音声を分割中...")
+    if full_audio.dtype == np.int16:
+        audio_float = full_audio.astype(np.float32) / 32768.0
+    elif full_audio.dtype == np.int32:
+        audio_float = full_audio.astype(np.float32) / 2147483648.0
+    else:
+        audio_float = full_audio.astype(np.float32)
+        
+    intervals = librosa.effects.split(audio_float, top_db=45, frame_length=2048, hop_length=512)
     
-    # 4. 確認表示
-    # for note in final_notes:
-    #     print(f"[{note['start']:.2f}s - {note['end']:.2f}s] {note['text']} (MIDI: {note['pitch']})")
+    padding_samples = int(0.4 * sr)
+    padded_intervals = []
+    for start, end in intervals:
+        p_start = max(0, start - padding_samples)
+        p_end = min(total_samples, end + padding_samples)
+        padded_intervals.append([p_start, p_end])
+
+    merged_intervals = []
+    for interval in padded_intervals:
+        if not merged_intervals:
+            merged_intervals.append(interval)
+        else:
+            last = merged_intervals[-1]
+            if interval[0] <= last[1]:
+                last[1] = max(last[1], interval[1])
+            else:
+                merged_intervals.append(interval)
+
+    final_chunks = []
+    max_len = int(30.0 * sr)
+    for start, end in merged_intervals:
+        chunk_len = end - start
+        if chunk_len > max_len:
+            num_pieces = int(np.ceil(chunk_len / max_len))
+            piece_len = chunk_len // num_pieces
+            for i in range(num_pieces):
+                s = start + i * piece_len
+                e = start + (i + 1) * piece_len if i < num_pieces - 1 else end
+                final_chunks.append([int(s), int(e)])
+        else:
+            final_chunks.append([start, end])
+
+    all_final_notes = []
+    all_final_notes_w2v2 = []  # Wav2Vec2単独出力用
+    print(f"全 {len(final_chunks)} チャンクに分割しました。処理を開始します...")
+    
+    for i, (start_sample, end_sample) in enumerate(final_chunks):
+        chunk_audio = full_audio[start_sample:end_sample]
+        offset_seconds = start_sample / sr
+        
+        print(f"--- チャンク {i+1}/{len(final_chunks)} 処理中: {offset_seconds:.2f}s - {end_sample/sr:.2f}s ---")
+        
+        # 音声が短すぎる場合はスキップ
+        if (end_sample - start_sample) / sr < 0.5:
+            print("チャンクが短すぎるためスキップします。")
+            continue
+            
+        temp_audio_file = "temp_chunk.wav"
+        wavfile.write(temp_audio_file, sr, chunk_audio)
+        
+        # 1. 音声認識とアライメント (WhisperXハイブリッド)
+        char_segments = process_whisperx_chunk(temp_audio_file, model, model_a, metadata, device, offset_seconds)
+        
+        # 認識されたひらがなをコンソールに表示
+        chunk_lyric = "".join([seg["text"] for seg in char_segments])
+        print(f"  -> WhisperX認識結果: {chunk_lyric} (文字数: {len(char_segments)})")
+        
+        # 1.5. Wav2Vec2による純粋な文字起こしとタイミング検出 (デバッグ用)
+        char_segments_w2v2 = process_wav2vec2_ctc_chunk(temp_audio_file, model_w2v2, processor_w2v2, device_w2v2, offset_seconds)
+        print(f"  -> Wav2Vec2検出数: {len(char_segments_w2v2)}")
+        
+        # 2. ピッチ推移の取得
+        time_array, midi_contour, confidence_array = get_pyworld_pitch_contour(temp_audio_file)
+        
+        # タイムアレイにオフセットを加算
+        if len(time_array) > 0:
+            time_array = time_array + offset_seconds
+            
+            # 1.5. Wav2Vec2のアライメント結果（歌詞マッピング）を先に生成
+            aligned_w2v2_chars = align_lyrics_to_timings(char_segments, char_segments_w2v2)
+            
+            # 3. データの結合とノート化 (ハイブリッド出力用)
+            # Wav2Vec2の正確なタイミングをベースに、隙間をピッチ追従の「ー」で埋める
+            final_notes = segment_and_align_notes(aligned_w2v2_chars, time_array, midi_contour, confidence_array)
+            all_final_notes.extend(final_notes)
+            
+            # Wav2Vec2単独出力用のノートリスト構築
+            final_notes_w2v2 = []
+            for seg in aligned_w2v2_chars:
+                mid_time = (seg["start"] + seg["end"]) / 2.0
+                idx = np.searchsorted(time_array, mid_time)
+                if idx >= len(midi_contour):
+                    idx = len(midi_contour) - 1
+                pitch = int(round(midi_contour[idx])) if len(midi_contour) > 0 else 60
+                final_notes_w2v2.append({
+                    "text": seg["text"],
+                    "start": seg["start"],
+                    "end": seg["end"],
+                    "pitch": pitch
+                })
+            all_final_notes_w2v2.extend(final_notes_w2v2)
+        
+        if os.path.exists(temp_audio_file):
+            os.remove(temp_audio_file)
+            
+    # メモリ解放
+    del model, model_a, model_w2v2, processor_w2v2
+    gc.collect()
+    if device == "cuda":
+        torch.cuda.empty_cache()
     
     # 5. USTファイルとして保存
-    export_to_ust(final_notes, output_ust)
+    export_to_ust(all_final_notes, output_ust)
+    export_to_ust(all_final_notes_w2v2, output_wav2vec2_ust)
     print("すべての処理が完了しました。")
