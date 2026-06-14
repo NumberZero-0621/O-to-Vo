@@ -29,7 +29,7 @@ def parse_ust(file_path):
             start_sec = (current_time_ticks / 480.0) * (60.0 / tempo)
             
             notes.append({
-                "lyric": lyric,
+                "lyric": jaconv.kata2hira(lyric),
                 "start": start_sec,
                 "end": start_sec + duration_sec,
                 "duration": duration_sec,
@@ -39,61 +39,68 @@ def parse_ust(file_path):
             
     return notes, tempo
 
-def compare_sequences(correct, output):
-    # Try to align sequences by lyric
-    # Use a simple matching to find where the output starts compared to correct
-    
-    print(f"{'Idx':<4} | {'Correct':<10} | {'Output':<10} | {'T_Start':<8} | {'T_End':<8} | {'Dur':<8} | {'Pitch'}")
-    print("-" * 80)
+def compare_robust(correct, output):
+    # Match lyrics by finding corresponding notes
+    print(f"{'C_Idx':<5} | {'O_Idx':<5} | {'Lyric':<10} | {'T_Diff':<8} | {'Dur_Diff'}")
+    print("-" * 60)
     
     c_i = 0
     o_i = 0
     
-    # Skip initial rests
-    while c_i < len(correct) and correct[c_i]['lyric'] == 'R': c_i += 1
-    while o_i < len(output) and output[o_i]['lyric'] == 'R': o_i += 1
+    # Find the first non-R match to anchor
+    while c_i < len(correct) and correct[c_i]['lyric'] == 'r': c_i += 1
+    while o_i < len(output) and output[o_i]['lyric'] == 'r': o_i += 1
     
-    offset = output[o_i]['start'] - correct[c_i]['start']
+    if c_i >= len(correct) or o_i >= len(output):
+        print("No matching notes found.")
+        return
+
+    anchor_c = correct[c_i]
+    anchor_o = output[o_i]
+    offset = anchor_o['start'] - anchor_c['start']
     
-    for _ in range(100):
-        if c_i >= len(correct) or o_i >= len(output): break
+    last_o_match = o_i
+    
+    matched_count = 0
+    total_t_diff = 0
+    
+    for i in range(c_i, len(correct)):
+        c_note = correct[i]
+        if c_note['lyric'] == 'r': continue
         
-        c = correct[c_i]
-        o = output[o_i]
+        # Search for this lyric in output near the expected time
+        best_o = -1
+        min_dist = 999
         
-        c_lyric = c['lyric']
-        o_lyric = o['lyric']
+        expected_t = c_note['start'] + offset
         
-        # Check if lyrics match (roughly)
-        # Note: correct might have Katakana, output is Hiragana
-        c_hira = jaconv.kata2hira(c_lyric)
-        o_hira = jaconv.kata2hira(o_lyric)
+        # Look ahead in output
+        for j in range(last_o_match, min(last_o_match + 20, len(output))):
+            o_note = output[j]
+            if o_note['lyric'] == c_note['lyric']:
+                dist = abs(o_note['start'] - expected_t)
+                if dist < min_dist:
+                    min_dist = dist
+                    best_o = j
         
-        s_diff = (o['start'] - offset) - c['start']
-        e_diff = (o['end'] - offset) - c['end']
-        d_diff = o['duration'] - c['duration']
-        p_diff = o['pitch'] - c['pitch']
-        
-        match_str = "OK" if c_hira == o_hira else "!!"
-        
-        print(f"{c_i:<4} | {c_lyric:<10} | {o_lyric:<10} | {s_diff:+.3f} | {e_diff:+.3f} | {d_diff:+.3f} | {p_diff:+d} {match_str}")
-        
-        # Advance logic: if they don't match, try to see if one is split or merged
-        if c_hira == o_hira:
-            c_i += 1
-            o_i += 1
+        if best_o != -1 and min_dist < 2.0: # Match within 2 seconds
+            o_note = output[best_o]
+            t_diff = (o_note['start'] - offset) - c_note['start']
+            d_diff = o_note['duration'] - c_note['duration']
+            print(f"{i:<5} | {best_o:<5} | {c_note['lyric']:<10} | {t_diff:+.3f} | {d_diff:+.3f}")
+            
+            last_o_match = best_o + 1
+            matched_count += 1
+            total_t_diff += abs(t_diff)
         else:
-            # If output is 'R' but correct is not, output might have missed a note
-            if o_lyric == 'R':
-                o_i += 1
-            elif c_lyric == 'R':
-                c_i += 1
-            else:
-                # Just advance both for now
-                c_i += 1
-                o_i += 1
+            # print(f"{i:<5} | {'MISS':<5} | {c_note['lyric']:<10} | {'-':<8} | {'-'}")
+            pass
+            
+    if matched_count > 0:
+        print(f"\nAverage Timing Error: {total_t_diff/matched_count:.3f}s")
+        print(f"Matched {matched_count} notes.")
 
 if __name__ == "__main__":
     correct, _ = parse_ust('correct.ust')
     output, _ = parse_ust('output_hybrid.ust')
-    compare_sequences(correct, output)
+    compare_robust(correct, output)

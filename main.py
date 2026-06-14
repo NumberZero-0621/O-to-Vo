@@ -114,6 +114,39 @@ def group_into_moras(chars):
             moras.append(char)
     return moras
 
+def merge_small_chars_in_segments(segments):
+    """
+    隣接するセグメントのうち、後続が小書き文字（ぁぃぅぇぉゃゅょゎ等）である場合、
+    前のセグメントにテキストを結合し、end時間を延長する。
+    促音（っ）は発音しないが長さを持ち、特殊な結合はしないため対象外とする。
+    """
+    small_chars = "ぁぃぅぇぉゃゅょゎァィゥェォャュョヮ"
+    merged = []
+    for seg in segments:
+        text = seg["text"]
+        if merged and all(c in small_chars for c in text):
+            merged[-1]["text"] += text
+            merged[-1]["end"] = max(merged[-1]["end"], seg["end"])
+        else:
+            merged.append(dict(seg))
+    return merged
+
+def filter_short_w2v2_segments(segments, min_duration=0.03):
+    """
+    Wav2Vec2が検出したセグメントの開始タイミングを比較し、
+    1つ前のセグメントとの開始タイミングの差が極端に短い（30ms未満など）場合、そのセグメントを除外する。
+    """
+    if not segments:
+        return []
+        
+    filtered = [segments[0]]
+    for seg in segments[1:]:
+        last_seg = filtered[-1]
+        # 前のノートの開始タイミングとの差分を計算
+        if (seg["start"] - last_seg["start"]) >= min_duration:
+            filtered.append(seg)
+    return filtered
+
 # ==========================================
 # 1. WhisperXで高精度なタイムスタンプを取得
 # ==========================================
@@ -335,11 +368,11 @@ def align_lyrics_to_timings(whisper_chars, w2v2_chars):
     dp = np.full((N + 1, M + 1), float('inf'))
     path = np.zeros((N + 1, M + 1), dtype=int)
     
-    SKIP_B_COST = 0.5
-    SQUEEZE_A_COST = 2.0
-    MATCH_REWARD = -2.0
-    MISMATCH_PENALTY = 1.0
-    TIME_WEIGHT = 2.0
+    # 時間を完全に無視するため、コストのバランスを調整
+    MATCH_REWARD = -5.0
+    MISMATCH_PENALTY = 2.0
+    SKIP_B_COST = 0.5     # Wav2Vec2の不要な文字をスキップ（長音化）するコスト
+    SQUEEZE_A_COST = 5.0  # Whisper側の文字を無理やり詰め込むコスト（基本避ける）
     
     dp[0][0] = 0.0
     for j in range(1, M + 1):
@@ -351,13 +384,20 @@ def align_lyrics_to_timings(whisper_chars, w2v2_chars):
             a_mid = (whisper_chars[i-1]["start"] + whisper_chars[i-1]["end"]) / 2.0
             b_mid = (w2v2_chars[j-1]["start"] + w2v2_chars[j-1]["end"]) / 2.0
             tdiff = abs(a_mid - b_mid)
-            base_cost = tdiff * TIME_WEIGHT
             
-            char_cost = MATCH_REWARD if whisper_chars[i-1]["text"] == w2v2_chars[j-1]["text"] else MISMATCH_PENALTY
+            # 時間はあくまで「文字が重複した時のタイブレーカー（微小なペナルティ）」としてのみ使う
+            # tdiffが10秒あっても0.1のペナルティにしかならないため、マッチング報酬(-5.0)を覆すことはない
+            time_penalty = tdiff * 0.01
             
-            cost_match = dp[i-1][j-1] + base_cost + char_cost
+            # Whisper側の文字(例: "ふぉ")の中にWav2Vec2の文字(例: "ふ"や"ぉ")が含まれていれば一致とみなす
+            if w2v2_chars[j-1]["text"] in whisper_chars[i-1]["text"]:
+                char_cost = MATCH_REWARD
+            else:
+                char_cost = MISMATCH_PENALTY
+            
+            cost_match = dp[i-1][j-1] + char_cost + time_penalty
             cost_skip_b = dp[i][j-1] + SKIP_B_COST
-            cost_squeeze_a = dp[i-1][j] + base_cost + SQUEEZE_A_COST
+            cost_squeeze_a = dp[i-1][j] + SQUEEZE_A_COST
             
             costs = [cost_match, cost_skip_b, cost_squeeze_a]
             min_cost = min(costs)
@@ -390,6 +430,8 @@ def align_lyrics_to_timings(whisper_chars, w2v2_chars):
             if b_skipped[j]:
                 # 何も割り当てられなかった場合は元のWav2Vec2の結果を維持するか、スキップするか
                 # 現状は元のテキスト（またはR等）を維持
+                seg_template["text"] = "ー"  # 不要な文字を長音に変換
+                seg_template["is_skipped"] = True
                 aligned_notes.append(seg_template)
             else:
                 # 原理上ここには来ないはずだが念のため
@@ -399,18 +441,23 @@ def align_lyrics_to_timings(whisper_chars, w2v2_chars):
         # 割り当てられた文字をモーラ（ノート単位）にまとめる
         moras = group_into_moras(assigned_chars)
         
+        # 複数のモーラがある場合、最後のモーラを長めにする（例: 70%を最後に、残りを均等に）
+        total_duration = seg_template["end"] - seg_template["start"]
         if len(moras) > 1:
-            # 複数のモーラがある場合、セグメントを分割して個別のノートにする
-            total_duration = seg_template["end"] - seg_template["start"]
-            mora_duration = total_duration / len(moras)
+            last_mora_ratio = 0.7
+            other_mora_duration = (total_duration * (1 - last_mora_ratio)) / (len(moras) - 1)
+            last_mora_duration = total_duration * last_mora_ratio
+            
+            current_offset = 0
             for k, mora in enumerate(moras):
                 new_seg = dict(seg_template)
                 new_seg["text"] = mora
-                new_seg["start"] = seg_template["start"] + k * mora_duration
-                new_seg["end"] = seg_template["start"] + (k + 1) * mora_duration
+                new_seg["start"] = seg_template["start"] + current_offset
+                dur = last_mora_duration if k == len(moras) - 1 else other_mora_duration
+                new_seg["end"] = new_seg["start"] + dur
                 aligned_notes.append(new_seg)
+                current_offset += dur
         else:
-            # 1つのモーラのみの場合
             seg_template["text"] = moras[0] if moras else ""
             aligned_notes.append(seg_template)
         
@@ -420,7 +467,7 @@ def align_lyrics_to_timings(whisper_chars, w2v2_chars):
 # 3. ノートの分割と文字の割り当て（ハイブリッド処理）
 # ==========================================
 def segment_and_align_notes(char_segments, time_array, midi_contour, confidence_array, min_duration=0.03):
-    print("統合タイムライン方式によるノート生成を実行中...")
+    # print("統合タイムライン方式によるノート生成を実行中...")
     
     if len(time_array) == 0:
         return []
@@ -432,28 +479,28 @@ def segment_and_align_notes(char_segments, time_array, midi_contour, confidence_
     # 開始時間でソート
     char_segments_sorted = sorted(char_segments, key=lambda x: x["start"])
     
-    for char_info in char_segments_sorted:
+    for i, char_info in enumerate(char_segments_sorted):
         # この文字の区間に対応するタイムラインのインデックス範囲を特定
         start_idx = np.searchsorted(time_array, char_info["start"])
         end_idx = np.searchsorted(time_array, char_info["end"])
         for idx in range(start_idx, end_idx):
             if idx < len(timeline_texts):
-                timeline_texts[idx] = char_info["text"]
+                timeline_texts[idx] = {"text": char_info["text"], "id": i}
 
     # ギャップ（Wav2Vec2で検出されなかった有声音区間）を「直前の文字」で埋める
     # これにより、ピッチが同じであればWav2Vec2の検出タイミングと結合され、1つの長いノートになる
-    last_text = None
+    last_info = None
     for i in range(len(timeline_texts)):
         if timeline_texts[i] is not None:
-            last_text = timeline_texts[i]
+            last_info = timeline_texts[i]
         else:
-            if last_text is not None and confidence_array[i] > 0:
-                timeline_texts[i] = last_text
+            if last_info is not None and confidence_array[i] > 0:
+                timeline_texts[i] = last_info
 
     # 無音（休符）の判定
     # ピッチが取れなかった（無声音/無音）区間が一定時間以上続いた場合、Rest (None) にする
     # 子音の無声化（k, s, t など）は通常短いため、短時間の無声音はそのまま歌詞を継続させる
-    unvoiced_threshold_frames = 25  # 250ms
+    unvoiced_threshold_frames = 10  # 100ms (速いパッセージに対応するため短縮)
     current_unvoiced_len = 0
     
     for i in range(len(confidence_array)):
@@ -473,55 +520,54 @@ def segment_and_align_notes(char_segments, time_array, midi_contour, confidence_
 
     # 2. チャンク化（歌詞と丸められたピッチの両方が同じ区間を統合）
     raw_notes = []
-    current_text = timeline_texts[0]
+    current_info = timeline_texts[0]
     current_midi = int(round(midi_contour[0]))
     current_start = time_array[0]
-    
     for i in range(1, len(time_array)):
-        this_text = timeline_texts[i]
-        this_midi = int(round(midi_contour[i]))
+        this_info = timeline_texts[i]
         
-        # 歌詞が変わるか、歌詞がある区間内でピッチが変わった場合に区切る
-        if this_text != current_text or (current_text is not None and this_midi != current_midi):
+        # ノートIDが変わるタイミングでのみ区切る（同じ文字でもIDが違えば区切る）
+        if this_info != current_info:
+            # 区間内のピッチの中央値を採用する
+            start_frame = np.searchsorted(time_array, current_start)
+            segment_pitches = midi_contour[start_frame:i]
+            valid_pitches = segment_pitches[~np.isnan(segment_pitches)]
+            if len(valid_pitches) > 0:
+                note_pitch = int(round(np.median(valid_pitches)))
+            else:
+                note_pitch = current_midi
+                
             raw_notes.append({
-                "lyric": current_text if current_text else "R",
+                "lyric": current_info["text"] if current_info else "R",
                 "start": current_start,
                 "end": time_array[i],
-                "pitch": current_midi if current_text else 60
+                "pitch": note_pitch if current_info else 60,
+                "pitch_curve": segment_pitches.tolist() if current_info else []
             })
-            current_text = this_text
-            current_midi = this_midi
+            current_info = this_info
+            current_midi = note_pitch # 次の区間のデフォルトピッチとして更新
             current_start = time_array[i]
             
     # 最後の区間を追加
+    # 最後の区間のピッチ計算
+    start_frame = np.searchsorted(time_array, current_start)
+    segment_pitches = midi_contour[start_frame:]
+    valid_pitches = segment_pitches[~np.isnan(segment_pitches)]
+    if len(valid_pitches) > 0:
+        note_pitch = int(round(np.median(valid_pitches)))
+    else:
+        note_pitch = current_midi
+
     raw_notes.append({
-        "lyric": current_text if current_text else "R",
+        "lyric": current_info["text"] if current_info else "R",
         "start": current_start,
         "end": time_array[-1],
-        "pitch": current_midi if current_text else 60
+        "pitch": note_pitch if current_info else 60,
+        "pitch_curve": segment_pitches.tolist() if current_info else []
     })
 
-    # 2.5 短いノートの統合（ノイズ除去）
-    # 歌詞が異なっていても、どちらかが短すぎる場合は統合する
-    merged_raw_notes = []
-    for note in raw_notes:
-        if not merged_raw_notes:
-            merged_raw_notes.append(dict(note))
-            continue
-            
-        last_note = merged_raw_notes[-1]
-        last_duration = last_note["end"] - last_note["start"]
-        duration = note["end"] - note["start"]
-        
-        # どちらかが短すぎる場合、統合する
-        if duration < min_duration or last_duration < min_duration:
-            # 長い方のノートの歌詞とピッチを優先する
-            if duration > last_duration:
-                last_note["lyric"] = note["lyric"]
-                last_note["pitch"] = note["pitch"]
-            last_note["end"] = note["end"]
-        else:
-            merged_raw_notes.append(dict(note))
+    # 短いノートの統合（ノイズ除去）は撤廃し、すべてのノートをそのまま出力する
+    merged_raw_notes = raw_notes
 
     # 3. データの整形と「ー」の割当
     final_notes = []
@@ -545,7 +591,8 @@ def segment_and_align_notes(char_segments, time_array, midi_contour, confidence_
             "original_text": lyric,
             "start": note["start"],
             "end": note["end"],
-            "pitch": note["pitch"]
+            "pitch": note["pitch"],
+            "pitch_curve": note.get("pitch_curve", [])
         })
         
     # 4. 極端な低音ノイズの削除（休符化）
@@ -568,7 +615,7 @@ def segment_and_align_notes(char_segments, time_array, midi_contour, confidence_
 # ==========================================
 # 4. USTファイルの書き出し
 # ==========================================
-def export_to_ust(ust_notes, output_path, tempo=120):
+def export_to_ust(ust_notes, output_path, tempo=170):
     print(f"USTファイルを書き出し中: {output_path}")
     if not ust_notes:
         print("警告: 書き出せるノートがありません。")
@@ -576,34 +623,36 @@ def export_to_ust(ust_notes, output_path, tempo=120):
 
     try:
         with open(output_path, "w", encoding="shift_jis") as f:
+            f.write("[#VERSION]\n")
+            f.write("UST Version1.2\n")
             f.write("[#SETTING]\n")
             f.write(f"Tempo={tempo}\n")
             f.write("Tracks=1\n")
             f.write("ProjectName=O-to-Vo_Output\n")
+            f.write("Mode2=True\n")
             
             ticks_per_second = (tempo * 480) / 60
+            
+            # 各ノートの絶対的な開始・終了Tickを先に計算
+            for note in ust_notes:
+                note["start_tick"] = int(round(note["start"] * ticks_per_second))
+                note["end_tick"] = int(round(note["end"] * ticks_per_second))
+                
+            # オーバーラップの解消（前のノートの後ろを削ることで、開始タイミングを死守する）
+            for i in range(len(ust_notes) - 1):
+                if ust_notes[i]["end_tick"] > ust_notes[i+1]["start_tick"]:
+                    ust_notes[i]["end_tick"] = ust_notes[i+1]["start_tick"]
+                    
             current_tick = 0
             prev_vowel = "あ"
             note_idx = 0
 
-            # 1. 音声の冒頭が 0秒から始まっていない場合、休符を挿入
-            first_note_start_tick = int(round(ust_notes[0]["start"] * ticks_per_second))
-            if first_note_start_tick > 0:
-                f.write(f"[#{str(note_idx).zfill(4)}]\n")
-                f.write(f"Length={first_note_start_tick}\n")
-                f.write("Lyric=R\n")
-                f.write("NoteNum=60\n")
-                f.write("PreUtterance=0\n")
-                f.write("VoiceOverlap=0\n")
-                note_idx += 1
-                current_tick = first_note_start_tick
-
-            # 2. ノートの書き出し
+            # ノートの書き出し
             for i, note in enumerate(ust_notes):
-                start_tick = int(round(note["start"] * ticks_per_second))
-                end_tick = int(round(note["end"] * ticks_per_second))
+                start_tick = note["start_tick"]
+                end_tick = note["end_tick"]
                 
-                # もし current_tick より start_tick が未来なら、休符を挿入する
+                # 休符の挿入（空き時間がある場合）
                 if start_tick > current_tick:
                     rest_length = start_tick - current_tick
                     f.write(f"[#{str(note_idx).zfill(4)}]\n")
@@ -615,10 +664,7 @@ def export_to_ust(ust_notes, output_path, tempo=120):
                     note_idx += 1
                     current_tick = start_tick
                 
-                # 絶対座標（ティック）を計算し、前との差分を Length とする
-                length_ticks = end_tick - current_tick
-                
-                # 重複や逆転を防止
+                length_ticks = end_tick - start_tick
                 if length_ticks <= 0:
                     continue
 
@@ -635,9 +681,59 @@ def export_to_ust(ust_notes, output_path, tempo=120):
                 f.write(f"Length={length_ticks}\n")
                 f.write(f"Lyric={lyric}\n")
                 f.write(f"NoteNum={note['pitch']}\n")
-                # 重なりを物理的に排除するため PreUtterance と VoiceOverlap を 0 に固定
                 f.write("PreUtterance=0\n")
                 f.write("VoiceOverlap=0\n")
+                
+                # Mode2 ピッチカーブの出力
+                pitch_curve = note.get("pitch_curve", [])
+                if lyric != "R" and len(pitch_curve) > 0:
+                    note_pitch = note['pitch']
+                    pby_list = []
+                    for p in pitch_curve:
+                        if np.isnan(p):
+                            pby_list.append("") # 無効値は空にする
+                        else:
+                            # PBY = 偏差(半音) * 10
+                            diff = (p - note_pitch) * 10
+                            pby_list.append(str(int(round(diff))))
+                    
+                    # 連続する空のPBYをクリーンアップするか、最初の有効値を見つける
+                    while len(pby_list) > 0 and pby_list[0] == "":
+                        pby_list[0] = "0"
+                        
+                    if len(pby_list) > 0:
+                        # 計算上のノート長(ms)
+                        note_length_ms = (length_ticks / ticks_per_second) * 1000
+                        
+                        # 現在のピッチカーブの長さ(ms)
+                        current_curve_ms = 10 * max(0, len(pby_list) - 1)
+                        
+                        pbw_list = ["10"] * max(0, len(pby_list) - 1)
+                        
+                        # ピッチカーブがノート長に満たない場合、ノート終端ギリギリに最後のピッチを維持する点を追加
+                        remaining_ms = note_length_ms - current_curve_ms
+                        if remaining_ms > 0:
+                            # 最後の有効なピッチ値を探す
+                            last_y = "0"
+                            for y in reversed(pby_list):
+                                if y != "":
+                                    last_y = y
+                                    break
+                            
+                            pbw_list.append(str(int(round(remaining_ms))))
+                            pby_list.append(last_y)
+
+                        # PBS: 0msの位置から開始し、最初のY値を設定
+                        y0 = pby_list[0] if pby_list[0] != "" else "0"
+                        f.write(f"PBS=0;{y0}\n")
+                        
+                        # PBW
+                        if len(pbw_list) > 0:
+                            f.write(f"PBW={','.join(pbw_list)}\n")
+                        
+                        # PBY: 2番目以降の値
+                        if len(pby_list) > 1:
+                            f.write(f"PBY={','.join(pby_list[1:])}\n")
                 
                 note_idx += 1
                 current_tick = end_tick
@@ -647,6 +743,18 @@ def export_to_ust(ust_notes, output_path, tempo=120):
     except Exception as e:
         print(f"UST書き出し中にエラーが発生しました: {e}")
 
+def estimate_tempo(audio_path, default_tempo=120):
+    print("BPM(テンポ)を自動推定中...")
+    try:
+        y, sr = librosa.load(audio_path)
+        tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
+        estimated_tempo = float(np.round(tempo[0]) if isinstance(tempo, np.ndarray) else np.round(tempo))
+        print(f"推定されたBPM: {estimated_tempo}")
+        return estimated_tempo
+    except Exception as e:
+        print(f"BPMの推定に失敗しました（デフォルトの {default_tempo} を使用します）: {e}")
+        return default_tempo
+
 # ==========================================
 # メイン処理（実行フロー）
 # ==========================================
@@ -654,10 +762,21 @@ if __name__ == "__main__":
     audio_file = "vocal.wav"
     output_ust = "output_hybrid.ust"
     output_wav2vec2_ust = "output_wav2vec2.ust"  # デバッグ用出力
+    output_whisper_ust = "output_whisper.ust"    # Whisperデバッグ用出力
+    
+    # ユーザー手動設定用の変数（None の場合は自動推定を行う）
+    # GUI化する際は、ここの値をUIから受け取るようにします
+    user_specified_tempo = None 
     
     if not os.path.exists(audio_file):
         print(f"エラー: {audio_file} が見つかりません。")
         exit(1)
+        
+    if user_specified_tempo:
+        target_tempo = user_specified_tempo
+        print(f"ユーザー指定のBPMを使用します: {target_tempo}")
+    else:
+        target_tempo = estimate_tempo(audio_file)
         
     # モデルの事前ロード
     model, model_a, metadata, device = load_whisperx_models()
@@ -679,9 +798,9 @@ if __name__ == "__main__":
     else:
         audio_float = full_audio.astype(np.float32)
         
-    intervals = librosa.effects.split(audio_float, top_db=45, frame_length=2048, hop_length=512)
+    intervals = librosa.effects.split(audio_float, top_db=40, frame_length=2048, hop_length=512)
     
-    padding_samples = int(0.4 * sr)
+    padding_samples = int(0.1 * sr)
     padded_intervals = []
     for start, end in intervals:
         p_start = max(0, start - padding_samples)
@@ -699,22 +818,11 @@ if __name__ == "__main__":
             else:
                 merged_intervals.append(interval)
 
-    final_chunks = []
-    max_len = int(30.0 * sr)
-    for start, end in merged_intervals:
-        chunk_len = end - start
-        if chunk_len > max_len:
-            num_pieces = int(np.ceil(chunk_len / max_len))
-            piece_len = chunk_len // num_pieces
-            for i in range(num_pieces):
-                s = start + i * piece_len
-                e = start + (i + 1) * piece_len if i < num_pieces - 1 else end
-                final_chunks.append([int(s), int(e)])
-        else:
-            final_chunks.append([start, end])
+    final_chunks = merged_intervals
 
     all_final_notes = []
     all_final_notes_w2v2 = []  # Wav2Vec2単独出力用
+    all_final_notes_whisper = [] # Whisperデバッグ出力用
     print(f"全 {len(final_chunks)} チャンクに分割しました。処理を開始します...")
     
     for i, (start_sample, end_sample) in enumerate(final_chunks):
@@ -750,12 +858,30 @@ if __name__ == "__main__":
             time_array = time_array + offset_seconds
             
             # 1.5. Wav2Vec2のアライメント結果（歌詞マッピング）を先に生成
-            aligned_w2v2_chars = align_lyrics_to_timings(char_segments, char_segments_w2v2)
+            
+            # WhisperX側のみ、小書き文字を直前の文字とマージして1モーラ化する（例: "ふ" + "ぉ" -> "ふぉ"）
+            char_segments_merged = merge_small_chars_in_segments(char_segments)
+            
+            # Wav2Vec2側はマージせず、極端に短いノート（30ms未満など）のみをノイズとして削除する
+            char_segments_w2v2_filtered = filter_short_w2v2_segments(char_segments_w2v2, min_duration=0.03)
+            
+            aligned_w2v2_chars = align_lyrics_to_timings(char_segments_merged, char_segments_w2v2_filtered)
             
             # 3. データの結合とノート化 (ハイブリッド出力用)
             # Wav2Vec2の正確なタイミングをベースに、隙間をピッチ追従の「ー」で埋める
             final_notes = segment_and_align_notes(aligned_w2v2_chars, time_array, midi_contour, confidence_array)
             all_final_notes.extend(final_notes)
+            
+            # Whisperデバッグ用: is_skipped な文字を "R" (休符) に置き換える
+            aligned_whisper_chars = []
+            for seg in aligned_w2v2_chars:
+                new_seg = dict(seg)
+                if new_seg.get("is_skipped", False):
+                    new_seg["text"] = "R"
+                aligned_whisper_chars.append(new_seg)
+            
+            final_notes_whisper = segment_and_align_notes(aligned_whisper_chars, time_array, midi_contour, confidence_array)
+            all_final_notes_whisper.extend(final_notes_whisper)
             
             # Wav2Vec2単独出力用のノートリスト構築
             final_notes_w2v2 = []
@@ -783,6 +909,7 @@ if __name__ == "__main__":
         torch.cuda.empty_cache()
     
     # 5. USTファイルとして保存
-    export_to_ust(all_final_notes, output_ust)
-    export_to_ust(all_final_notes_w2v2, output_wav2vec2_ust)
+    export_to_ust(all_final_notes, output_ust, tempo=target_tempo)
+    export_to_ust(all_final_notes_w2v2, output_wav2vec2_ust, tempo=target_tempo)
+    export_to_ust(all_final_notes_whisper, output_whisper_ust, tempo=target_tempo)
     print("すべての処理が完了しました。")
