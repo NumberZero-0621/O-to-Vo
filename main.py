@@ -1,5 +1,10 @@
 import os
 import warnings
+import sys
+import threading
+import tkinter as tk
+from tkinter import filedialog, messagebox, scrolledtext
+from tkinter import ttk
 
 # ==========================================
 # ログ・警告の抑制設定
@@ -150,14 +155,14 @@ def filter_short_w2v2_segments(segments, min_duration=0.03):
 # ==========================================
 # 1. WhisperXで高精度なタイムスタンプを取得
 # ==========================================
-def load_whisperx_models():
-    print("WhisperXモデルをロード中...")
+def load_whisperx_models(whisper_model_name="large-v3", w2v2_model_name="vumichien/wav2vec2-large-xlsr-japanese-hiragana"):
+    print(f"WhisperXモデル({whisper_model_name}) および アライメントモデル({w2v2_model_name}) をロード中...")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     compute_type = "float16" if device == "cuda" else "int8"
     print(f"使用デバイス: {device} ({compute_type})")
 
-    model = whisperx.load_model("large-v3", device, compute_type=compute_type, language="ja")
-    model_a, metadata = whisperx.load_align_model(language_code="ja", device=device, model_name="vumichien/wav2vec2-large-xlsr-japanese-hiragana")
+    model = whisperx.load_model(whisper_model_name, device, compute_type=compute_type, language="ja")
+    model_a, metadata = whisperx.load_align_model(language_code="ja", device=device, model_name=w2v2_model_name)
     
     return model, model_a, metadata, device
 
@@ -234,12 +239,11 @@ def process_whisperx_chunk(audio_path, model, model_a, metadata, device, offset_
 # ==========================================
 # 1.5. Wav2Vec2の純粋なCTCデコード（デバッグ用）
 # ==========================================
-def load_wav2vec2_ctc_model():
-    print("Wav2Vec2(CTC)モデルをロード中...")
-    model_name = "vumichien/wav2vec2-large-xlsr-japanese-hiragana"
-    processor = Wav2Vec2Processor.from_pretrained(model_name)
+def load_wav2vec2_ctc_model(w2v2_model_name="vumichien/wav2vec2-large-xlsr-japanese-hiragana"):
+    print(f"Wav2Vec2(CTC)モデル({w2v2_model_name})をロード中...")
+    processor = Wav2Vec2Processor.from_pretrained(w2v2_model_name)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = Wav2Vec2ForCTC.from_pretrained(model_name).to(device)
+    model = Wav2Vec2ForCTC.from_pretrained(w2v2_model_name).to(device)
     return model, processor, device
 
 def process_wav2vec2_ctc_chunk(audio_path, model, processor, device, offset_seconds=0.0):
@@ -300,35 +304,83 @@ def process_wav2vec2_ctc_chunk(audio_path, model, processor, device, offset_seco
     return char_segments
 
 # ==========================================
-# 2. pyworldでピッチ連続データを取得
+# 2. ピッチ連続データを取得 (PyWorld / CREPE)
 # ==========================================
-def get_pyworld_pitch_contour(audio_path):
-    print("pyworld (harvest) でピッチ解析を実行中...")
+def get_pitch_contour(audio_path, frame_period=10.0, f0_model="PyWorld"):
+    print(f"{f0_model} でピッチ解析を実行中...")
     
-    # pyworldはfloat64形式の1D numpy配列を要求する
     sr, audio = wavfile.read(audio_path)
     
     # モノラル化
     if len(audio.shape) > 1:
         audio = np.mean(audio, axis=1)
         
-    # float64に変換し、必要に応じて正規化
-    if audio.dtype == np.int16:
-        audio = audio.astype(np.float64) / 32768.0
-    elif audio.dtype == np.int32:
-        audio = audio.astype(np.float64) / 2147483648.0
-    else:
-        audio = audio.astype(np.float64)
+    if f0_model == "CREPE":
+        try:
+            import torchcrepe
+        except ImportError:
+            raise ImportError("CREPEを使用するには torchcrepe が必要です。ターミナルで 'pip install torchcrepe' を実行してください。")
+            
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        
+        # torchcrepe expects float32 audio tensor with shape (1, N)
+        if audio.dtype == np.int16:
+            audio_f32 = audio.astype(np.float32) / 32768.0
+        elif audio.dtype == np.int32:
+            audio_f32 = audio.astype(np.float32) / 2147483648.0
+        else:
+            audio_f32 = audio.astype(np.float32)
+            
+        audio_tensor = torch.tensor(audio_f32).unsqueeze(0).to(device)
+        
+        # hop_length is calculated from frame_period (ms)
+        hop_length = int(sr * (frame_period / 1000.0))
+        
+        # Estimate pitch
+        f0, pd = torchcrepe.predict(
+            audio_tensor,
+            sr,
+            hop_length,
+            fmin=50,
+            fmax=2000,
+            model='full',
+            batch_size=2048,
+            device=device,
+            return_periodicity=True
+        )
+        
+        f0 = f0.squeeze().cpu().numpy()
+        pd = pd.squeeze().cpu().numpy()
+        
+        # Create time array
+        time = np.arange(len(f0)) * (frame_period / 1000.0)
+        
+        # Apply threshold to pd (periodicity/confidence) to simulate voiced/unvoiced
+        confidence = (pd > 0.5).astype(float)
+        f0[confidence == 0] = np.nan
+        
+    else: # PyWorld
+        # pyworldはfloat64形式の1D numpy配列を要求する
+        if audio.dtype == np.int16:
+            audio = audio.astype(np.float64) / 32768.0
+        elif audio.dtype == np.int32:
+            audio = audio.astype(np.float64) / 2147483648.0
+        else:
+            audio = audio.astype(np.float64)
+        
+        # harvestでF0推定
+        f0, time = pw.harvest(audio, sr, frame_period=frame_period)
+        confidence = (f0 > 0).astype(float)
     
-    # harvestでF0推定 (フレーム周期10ms)
-    f0, time = pw.harvest(audio, sr, frame_period=10.0)
-    
-    # 無音や判定不能時の 0Hz を NaN にして hz_to_midi の警告を回避
+    # 無音や判定不能時の 0Hz または NaN に対して処理
     f0_safe = np.copy(f0)
+    f0_safe[np.isnan(f0_safe)] = 0.0 # hz_to_midi is safer with non-nan, but librosa handles nan in recent versions.
     f0_safe[f0_safe == 0] = np.nan
     
     # 周波数(Hz)をMIDIノート番号（小数含む）に変換
-    midi_contour = librosa.hz_to_midi(f0_safe)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        midi_contour = librosa.hz_to_midi(f0_safe)
     
     # 補間処理：無音部分（NaN）のピッチが60に飛ぶと、不要なノート分割が発生するため、
     # 前後の有声音のピッチで補間（forward fill & backward fill）する。
@@ -348,15 +400,12 @@ def get_pyworld_pitch_contour(audio_path):
     else:
         midi_contour = np.full_like(midi_contour, 60.0)
     
-    # 有声音フラグを返す（無音・休符の判定に使用）
-    confidence = (f0 > 0).astype(float)
-    
     return time, midi_contour, confidence
 
 # ==========================================
 # DPを用いたWhisperXとWav2Vec2の歌詞マッピング
 # ==========================================
-def align_lyrics_to_timings(whisper_chars, w2v2_chars):
+def align_lyrics_to_timings(whisper_chars, w2v2_chars, skip_b_cost=0.5, last_mora_ratio=0.7):
     if not w2v2_chars:
         return []
     if not whisper_chars:
@@ -371,7 +420,7 @@ def align_lyrics_to_timings(whisper_chars, w2v2_chars):
     # 時間を完全に無視するため、コストのバランスを調整
     MATCH_REWARD = -5.0
     MISMATCH_PENALTY = 2.0
-    SKIP_B_COST = 0.5     # Wav2Vec2の不要な文字をスキップ（長音化）するコスト
+    SKIP_B_COST = skip_b_cost     # Wav2Vec2の不要な文字をスキップ（長音化）するコスト
     SQUEEZE_A_COST = 5.0  # Whisper側の文字を無理やり詰め込むコスト（基本避ける）
     
     dp[0][0] = 0.0
@@ -441,10 +490,9 @@ def align_lyrics_to_timings(whisper_chars, w2v2_chars):
         # 割り当てられた文字をモーラ（ノート単位）にまとめる
         moras = group_into_moras(assigned_chars)
         
-        # 複数のモーラがある場合、最後のモーラを長めにする（例: 70%を最後に、残りを均等に）
+        # 複数のモーラがある場合、最後のモーラを長めにする
         total_duration = seg_template["end"] - seg_template["start"]
         if len(moras) > 1:
-            last_mora_ratio = 0.7
             other_mora_duration = (total_duration * (1 - last_mora_ratio)) / (len(moras) - 1)
             last_mora_duration = total_duration * last_mora_ratio
             
@@ -466,7 +514,7 @@ def align_lyrics_to_timings(whisper_chars, w2v2_chars):
 # ==========================================
 # 3. ノートの分割と文字の割り当て（ハイブリッド処理）
 # ==========================================
-def segment_and_align_notes(char_segments, time_array, midi_contour, confidence_array, min_duration=0.03):
+def segment_and_align_notes(char_segments, time_array, midi_contour, confidence_array, min_duration=0.03, unvoiced_threshold_frames=10, low_pitch_threshold=47, low_pitch_drop_amount=18):
     # print("統合タイムライン方式によるノート生成を実行中...")
     
     if len(time_array) == 0:
@@ -500,7 +548,6 @@ def segment_and_align_notes(char_segments, time_array, midi_contour, confidence_
     # 無音（休符）の判定
     # ピッチが取れなかった（無声音/無音）区間が一定時間以上続いた場合、Rest (None) にする
     # 子音の無声化（k, s, t など）は通常短いため、短時間の無声音はそのまま歌詞を継続させる
-    unvoiced_threshold_frames = 10  # 100ms (速いパッセージに対応するため短縮)
     current_unvoiced_len = 0
     
     for i in range(len(confidence_array)):
@@ -596,14 +643,14 @@ def segment_and_align_notes(char_segments, time_array, midi_contour, confidence_
         })
         
     # 4. 極端な低音ノイズの削除（休符化）
-    # 直前の有効なノートより1.5オクターブ（18半音）以上低く、かつB2（47）以下のノートを休符（R）にする
+    # 直前の有効なノートより一定以上低く、かつ一定以下のノートを休符（R）にする
     last_valid_pitch = None
     for note in final_notes:
         if note["text"] == "R":
             continue
             
         if last_valid_pitch is not None:
-            if note["pitch"] <= 47 and note["pitch"] <= last_valid_pitch - 18:
+            if note["pitch"] <= low_pitch_threshold and note["pitch"] <= last_valid_pitch - low_pitch_drop_amount:
                 note["text"] = "R"
                 note["original_text"] = "R"
                 continue
@@ -633,15 +680,21 @@ def export_to_ust(ust_notes, output_path, tempo=170):
             
             ticks_per_second = (tempo * 480) / 60
             
-            # 各ノートの絶対的な開始・終了Tickを先に計算
+            # 各ノートの絶対的な開始・終了Tickを計算
             for note in ust_notes:
                 note["start_tick"] = int(round(note["start"] * ticks_per_second))
                 note["end_tick"] = int(round(note["end"] * ticks_per_second))
+                
+            # 開始タイミング順にソートする（チャンク結合時の順序ブレやオーバーラップを防ぐため）
+            ust_notes.sort(key=lambda x: x["start_tick"])
                 
             # オーバーラップの解消（前のノートの後ろを削ることで、開始タイミングを死守する）
             for i in range(len(ust_notes) - 1):
                 if ust_notes[i]["end_tick"] > ust_notes[i+1]["start_tick"]:
                     ust_notes[i]["end_tick"] = ust_notes[i+1]["start_tick"]
+                    
+            # 15ティック未満の非常に短いノートを除外（UTAUでの発音エラー回避のため）
+            ust_notes = [note for note in ust_notes if (note["end_tick"] - note["start_tick"]) >= 15]
                     
             current_tick = 0
             prev_vowel = "あ"
@@ -651,6 +704,10 @@ def export_to_ust(ust_notes, output_path, tempo=170):
             for i, note in enumerate(ust_notes):
                 start_tick = note["start_tick"]
                 end_tick = note["end_tick"]
+                
+                # 万が一の逆転を防ぐための厳密なチェック
+                if start_tick < current_tick:
+                    start_tick = current_tick
                 
                 # 休符の挿入（空き時間がある場合）
                 if start_tick > current_tick:
@@ -758,31 +815,84 @@ def estimate_tempo(audio_path, default_tempo=120):
 # ==========================================
 # メイン処理（実行フロー）
 # ==========================================
-if __name__ == "__main__":
-    audio_file = "vocal.wav"
-    output_ust = "output_hybrid.ust"
-    output_wav2vec2_ust = "output_wav2vec2.ust"  # デバッグ用出力
-    output_whisper_ust = "output_whisper.ust"    # Whisperデバッグ用出力
+def run_conversion(audio_file, output_base_path, user_specified_tempo, min_duration=0.03, export_hybrid=True, export_w2v2=False, export_whisper=False,
+                   unvoiced_threshold_frames=10, frame_period=10.0, low_pitch_threshold=47, low_pitch_drop_amount=18, top_db=40, skip_b_cost=0.5, last_mora_ratio=0.7,
+                   whisper_model_name="large-v3", w2v2_model_name="vumichien/wav2vec2-large-xlsr-japanese-hiragana", f0_model="PyWorld"):
+    # Normalize paths to avoid mixed slashes on Windows
+    audio_file = os.path.normpath(audio_file)
+    input_dir = os.path.dirname(audio_file)
+    base_name = os.path.splitext(os.path.basename(audio_file))[0]
     
-    # ユーザー手動設定用の変数（None の場合は自動推定を行う）
-    # GUI化する際は、ここの値をUIから受け取るようにします
-    user_specified_tempo = None 
+    # User specified output base path
+    output_base_path = os.path.normpath(output_base_path)
     
-    if not os.path.exists(audio_file):
-        print(f"エラー: {audio_file} が見つかりません。")
-        exit(1)
+    output_ust = f"{output_base_path}_hybrid.ust"
+    output_wav2vec2_ust = f"{output_base_path}_wav2vec2.ust"
+    output_whisper_ust = f"{output_base_path}_whisper.ust"
+    
+    # 拡張子が .wav でない場合、一時的にWAVファイルに変換する
+    is_temp_wav = False
+    process_audio_file = audio_file
+    if not audio_file.lower().endswith(".wav"):
+        process_audio_file = os.path.join(input_dir, f"{base_name}_temp.wav")
+        print(f"入力ファイルを読み込み、WAV形式に変換しています: {process_audio_file}")
+        
+        import tempfile
+        import shutil
+        import subprocess
+        
+        # FFmpeg等の一部ツールはWindowsで日本語パス（千本桜など）を正しく開けないため、
+        # 一旦安全なTempフォルダにコピーしてから処理する
+        temp_dir = tempfile.gettempdir()
+        _, ext = os.path.splitext(audio_file)
+        safe_input_path = os.path.join(temp_dir, f"oto_vo_temp_in{ext}")
+        safe_output_path = os.path.join(temp_dir, "oto_vo_temp_out.wav")
+        
+        try:
+            # 入力ファイルをTempにコピー
+            shutil.copy2(audio_file, safe_input_path)
+            
+            # まずはFFmpegで直接変換を試みる（librosaより高速で確実）
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", safe_input_path, "-ar", "16000", "-ac", "1", safe_output_path],
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            
+            # 成功したら元の出力先へコピー
+            shutil.copy2(safe_output_path, process_audio_file)
+            is_temp_wav = True
+            
+        except Exception:
+            # FFmpegが失敗した場合、librosaでの読み込みを試みる
+            try:
+                y, sr_load = librosa.load(safe_input_path, sr=16000, mono=True)
+                wavfile.write(process_audio_file, sr_load, y)
+                is_temp_wav = True
+            except Exception as e2:
+                print(f"エラー: 音声ファイルの読み込みまたはWAV変換に失敗しました。\nファイルが破損しているか、対応していない形式の可能性があります。\n詳細: {e2}")
+                if os.path.exists(safe_input_path): os.remove(safe_input_path)
+                if os.path.exists(safe_output_path): os.remove(safe_output_path)
+                return
+                
+        # Tempファイルのお掃除
+        if os.path.exists(safe_input_path): os.remove(safe_input_path)
+        if os.path.exists(safe_output_path): os.remove(safe_output_path)
+
+    if not os.path.exists(process_audio_file):
+        print(f"エラー: {process_audio_file} が見つかりません。")
+        return
         
     if user_specified_tempo:
         target_tempo = user_specified_tempo
         print(f"ユーザー指定のBPMを使用します: {target_tempo}")
     else:
-        target_tempo = estimate_tempo(audio_file)
+        target_tempo = estimate_tempo(process_audio_file)
         
     # モデルの事前ロード
-    model, model_a, metadata, device = load_whisperx_models()
-    model_w2v2, processor_w2v2, device_w2v2 = load_wav2vec2_ctc_model()
+    model, model_a, metadata, device = load_whisperx_models(whisper_model_name, w2v2_model_name)
+    model_w2v2, processor_w2v2, device_w2v2 = load_wav2vec2_ctc_model(w2v2_model_name)
     
-    sr, full_audio = wavfile.read(audio_file)
+    sr, full_audio = wavfile.read(process_audio_file)
     # モノラル化
     if len(full_audio.shape) > 1:
         full_audio = np.mean(full_audio, axis=1).astype(full_audio.dtype)
@@ -798,7 +908,7 @@ if __name__ == "__main__":
     else:
         audio_float = full_audio.astype(np.float32)
         
-    intervals = librosa.effects.split(audio_float, top_db=40, frame_length=2048, hop_length=512)
+    intervals = librosa.effects.split(audio_float, top_db=top_db, frame_length=2048, hop_length=512)
     
     padding_samples = int(0.1 * sr)
     padded_intervals = []
@@ -836,7 +946,7 @@ if __name__ == "__main__":
             print("チャンクが短すぎるためスキップします。")
             continue
             
-        temp_audio_file = "temp_chunk.wav"
+        temp_audio_file = os.path.join(input_dir, "temp_chunk.wav")
         wavfile.write(temp_audio_file, sr, chunk_audio)
         
         # 1. 音声認識とアライメント (WhisperXハイブリッド)
@@ -851,7 +961,7 @@ if __name__ == "__main__":
         print(f"  -> Wav2Vec2検出数: {len(char_segments_w2v2)}")
         
         # 2. ピッチ推移の取得
-        time_array, midi_contour, confidence_array = get_pyworld_pitch_contour(temp_audio_file)
+        time_array, midi_contour, confidence_array = get_pitch_contour(temp_audio_file, frame_period=frame_period, f0_model=f0_model)
         
         # タイムアレイにオフセットを加算
         if len(time_array) > 0:
@@ -859,17 +969,18 @@ if __name__ == "__main__":
             
             # 1.5. Wav2Vec2のアライメント結果（歌詞マッピング）を先に生成
             
-            # WhisperX側のみ、小書き文字を直前の文字とマージして1モーラ化する（例: "ふ" + "ぉ" -> "ふぉ"）
+            # WhisperX側の小書き文字を直前の文字とマージして1モーラ化する（例: "ふ" + "ぉ" -> "ふぉ"）
             char_segments_merged = merge_small_chars_in_segments(char_segments)
             
-            # Wav2Vec2側はマージせず、極端に短いノート（30ms未満など）のみをノイズとして削除する
-            char_segments_w2v2_filtered = filter_short_w2v2_segments(char_segments_w2v2, min_duration=0.03)
+            # Wav2Vec2側も同様に小書き文字をマージする（「しょ」等が2つのノートに分裂するのを防ぐため）
+            char_segments_w2v2_filtered = filter_short_w2v2_segments(char_segments_w2v2, min_duration=min_duration)
+            char_segments_w2v2_merged = merge_small_chars_in_segments(char_segments_w2v2_filtered)
             
-            aligned_w2v2_chars = align_lyrics_to_timings(char_segments_merged, char_segments_w2v2_filtered)
+            aligned_w2v2_chars = align_lyrics_to_timings(char_segments_merged, char_segments_w2v2_merged, skip_b_cost=skip_b_cost, last_mora_ratio=last_mora_ratio)
             
             # 3. データの結合とノート化 (ハイブリッド出力用)
             # Wav2Vec2の正確なタイミングをベースに、隙間をピッチ追従の「ー」で埋める
-            final_notes = segment_and_align_notes(aligned_w2v2_chars, time_array, midi_contour, confidence_array)
+            final_notes = segment_and_align_notes(aligned_w2v2_chars, time_array, midi_contour, confidence_array, min_duration=min_duration, unvoiced_threshold_frames=unvoiced_threshold_frames, low_pitch_threshold=low_pitch_threshold, low_pitch_drop_amount=low_pitch_drop_amount)
             all_final_notes.extend(final_notes)
             
             # Whisperデバッグ用: is_skipped な文字を "R" (休符) に置き換える
@@ -880,7 +991,7 @@ if __name__ == "__main__":
                     new_seg["text"] = "R"
                 aligned_whisper_chars.append(new_seg)
             
-            final_notes_whisper = segment_and_align_notes(aligned_whisper_chars, time_array, midi_contour, confidence_array)
+            final_notes_whisper = segment_and_align_notes(aligned_whisper_chars, time_array, midi_contour, confidence_array, min_duration=min_duration, unvoiced_threshold_frames=unvoiced_threshold_frames, low_pitch_threshold=low_pitch_threshold, low_pitch_drop_amount=low_pitch_drop_amount)
             all_final_notes_whisper.extend(final_notes_whisper)
             
             # Wav2Vec2単独出力用のノートリスト構築
@@ -909,7 +1020,320 @@ if __name__ == "__main__":
         torch.cuda.empty_cache()
     
     # 5. USTファイルとして保存
-    export_to_ust(all_final_notes, output_ust, tempo=target_tempo)
-    export_to_ust(all_final_notes_w2v2, output_wav2vec2_ust, tempo=target_tempo)
-    export_to_ust(all_final_notes_whisper, output_whisper_ust, tempo=target_tempo)
+    if export_hybrid:
+        export_to_ust(all_final_notes, output_ust, tempo=target_tempo)
+    if export_w2v2:
+        export_to_ust(all_final_notes_w2v2, output_wav2vec2_ust, tempo=target_tempo)
+    if export_whisper:
+        export_to_ust(all_final_notes_whisper, output_whisper_ust, tempo=target_tempo)
+        
+    if is_temp_wav and os.path.exists(process_audio_file):
+        os.remove(process_audio_file)
+        
     print("すべての処理が完了しました。")
+
+class ThreadSafeTextRedirector:
+    def __init__(self, text_widget):
+        self.text_widget = text_widget
+
+    def write(self, string):
+        self.text_widget.after(0, self._write, string)
+
+    def _write(self, string):
+        self.text_widget.configure(state='normal')
+        self.text_widget.insert(tk.END, string)
+        self.text_widget.see(tk.END)
+        self.text_widget.configure(state='disabled')
+
+    def flush(self):
+        pass
+
+class OToVoApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("O-to-Vo (Audio to UST Converter)")
+        self.root.geometry("650x600")
+        
+        self.audio_file_path = tk.StringVar()
+        self.output_base_path_var = tk.StringVar()
+        self.tempo_var = tk.StringVar()
+        self.min_duration_var = tk.StringVar(value="0.03")
+        self.unvoiced_threshold_var = tk.StringVar(value="10")
+        self.frame_period_var = tk.StringVar(value="10.0")
+        self.low_pitch_threshold_var = tk.StringVar(value="47")
+        self.low_pitch_drop_amount_var = tk.StringVar(value="18")
+        self.top_db_var = tk.StringVar(value="40")
+        self.skip_b_cost_var = tk.StringVar(value="0.5")
+        self.last_mora_ratio_var = tk.StringVar(value="0.7")
+        self.whisper_model_var = tk.StringVar(value="large-v3")
+        self.w2v2_model_var = tk.StringVar(value="vumichien/wav2vec2-large-xlsr-japanese-hiragana")
+        self.f0_model_var = tk.StringVar(value="PyWorld")
+        self.export_hybrid_var = tk.BooleanVar(value=True)
+        self.export_w2v2_var = tk.BooleanVar(value=False)
+        self.export_whisper_var = tk.BooleanVar(value=False)
+        
+        self.create_widgets()
+        
+        # 標準出力と標準エラー出力をテキストボックスにリダイレクト
+        sys.stdout = ThreadSafeTextRedirector(self.log_text)
+        sys.stderr = ThreadSafeTextRedirector(self.log_text)
+
+    def create_widgets(self):
+        frame = ttk.Frame(self.root, padding="10")
+        frame.pack(fill=tk.BOTH, expand=True)
+        
+        # File selection
+        file_frame = ttk.Frame(frame)
+        file_frame.pack(fill=tk.X, pady=5)
+        
+        ttk.Label(file_frame, text="音声ファイル:").pack(side=tk.LEFT)
+        ttk.Entry(file_frame, textvariable=self.audio_file_path, state='readonly', width=50).pack(side=tk.LEFT, padx=5)
+        ttk.Button(file_frame, text="参照...", command=self.browse_file).pack(side=tk.LEFT)
+        
+        # Output selection
+        output_frame = ttk.Frame(frame)
+        output_frame.pack(fill=tk.X, pady=5)
+        
+        ttk.Label(output_frame, text="出力ベースパス:").pack(side=tk.LEFT)
+        ttk.Entry(output_frame, textvariable=self.output_base_path_var, width=50).pack(side=tk.LEFT, padx=5)
+        ttk.Button(output_frame, text="保存先...", command=self.browse_output).pack(side=tk.LEFT)
+        
+        # Model selection
+        model_frame = ttk.LabelFrame(frame, text="モデル設定", padding="5")
+        model_frame.pack(fill=tk.X, pady=5)
+        
+        ttk.Label(model_frame, text="WhisperX (歌詞認識):").grid(row=0, column=0, sticky=tk.W, pady=2)
+        whisper_models = ["large-v3", "large-v2", "medium", "small", "base", "tiny", "URLを指定してモデル追加"]
+        whisper_cb = ttk.Combobox(model_frame, textvariable=self.whisper_model_var, values=whisper_models, state="readonly", width=55)
+        whisper_cb.grid(row=0, column=1, sticky=tk.W, padx=5, pady=2)
+        whisper_cb.bind("<<ComboboxSelected>>", self.on_model_select)
+        
+        ttk.Label(model_frame, text="Wav2Vec2 (タイミング):").grid(row=1, column=0, sticky=tk.W, pady=2)
+        w2v2_models = ["vumichien/wav2vec2-large-xlsr-japanese-hiragana", "jonatasgrosman/wav2vec2-large-xlsr-53-japanese", "URLを指定してモデル追加"]
+        w2v2_cb = ttk.Combobox(model_frame, textvariable=self.w2v2_model_var, values=w2v2_models, state="readonly", width=55)
+        w2v2_cb.grid(row=1, column=1, sticky=tk.W, padx=5, pady=2)
+        w2v2_cb.bind("<<ComboboxSelected>>", self.on_model_select)
+        
+        ttk.Label(model_frame, text="F0推定 (ピッチ):").grid(row=2, column=0, sticky=tk.W, pady=2)
+        f0_models = ["PyWorld", "CREPE"]
+        f0_cb = ttk.Combobox(model_frame, textvariable=self.f0_model_var, values=f0_models, state="readonly", width=55)
+        f0_cb.grid(row=2, column=1, sticky=tk.W, padx=5, pady=2)
+        
+        # Options frame
+        options_frame = ttk.Frame(frame)
+        options_frame.pack(fill=tk.X, pady=5)
+        
+        ttk.Label(options_frame, text="BPM (空欄で自動推定):").grid(row=0, column=0, sticky=tk.W, pady=2)
+        ttk.Entry(options_frame, textvariable=self.tempo_var, width=10).grid(row=0, column=1, sticky=tk.W, padx=5, pady=2)
+        
+        # --- 追加パラメータ（詳細設定予定） ---
+        advanced_frame = ttk.LabelFrame(frame, text="詳細設定", padding="5")
+        advanced_frame.pack(fill=tk.X, pady=5)
+        
+        ttk.Label(advanced_frame, text="休符判定フレーム数:").grid(row=0, column=0, sticky=tk.W, pady=2)
+        ttk.Entry(advanced_frame, textvariable=self.unvoiced_threshold_var, width=10).grid(row=0, column=1, sticky=tk.W, padx=5, pady=2)
+        
+        ttk.Label(advanced_frame, text="ピッチ解析間隔(ms):").grid(row=0, column=2, sticky=tk.W, pady=2, padx=(10,0))
+        ttk.Entry(advanced_frame, textvariable=self.frame_period_var, width=10).grid(row=0, column=3, sticky=tk.W, padx=5, pady=2)
+        
+        ttk.Label(advanced_frame, text="低音ノイズ削除閾値(MIDI):").grid(row=1, column=0, sticky=tk.W, pady=2)
+        ttk.Entry(advanced_frame, textvariable=self.low_pitch_threshold_var, width=10).grid(row=1, column=1, sticky=tk.W, padx=5, pady=2)
+        
+        ttk.Label(advanced_frame, text="低音ノイズ落差(半音):").grid(row=1, column=2, sticky=tk.W, pady=2, padx=(10,0))
+        ttk.Entry(advanced_frame, textvariable=self.low_pitch_drop_amount_var, width=10).grid(row=1, column=3, sticky=tk.W, padx=5, pady=2)
+        
+        ttk.Label(advanced_frame, text="無音分割閾値(top_db):").grid(row=2, column=0, sticky=tk.W, pady=2)
+        ttk.Entry(advanced_frame, textvariable=self.top_db_var, width=10).grid(row=2, column=1, sticky=tk.W, padx=5, pady=2)
+        
+        ttk.Label(advanced_frame, text="文字スキップコスト:").grid(row=2, column=2, sticky=tk.W, pady=2, padx=(10,0))
+        ttk.Entry(advanced_frame, textvariable=self.skip_b_cost_var, width=10).grid(row=2, column=3, sticky=tk.W, padx=5, pady=2)
+        
+        ttk.Label(advanced_frame, text="最終モーラ時間比率:").grid(row=3, column=0, sticky=tk.W, pady=2)
+        ttk.Entry(advanced_frame, textvariable=self.last_mora_ratio_var, width=10).grid(row=3, column=1, sticky=tk.W, padx=5, pady=2)
+        
+        ttk.Label(advanced_frame, text="最小ノート長(秒):").grid(row=3, column=2, sticky=tk.W, pady=2, padx=(10,0))
+        ttk.Entry(advanced_frame, textvariable=self.min_duration_var, width=10).grid(row=3, column=3, sticky=tk.W, padx=5, pady=2)
+        
+        # Export checkboxes frame
+        export_frame = ttk.LabelFrame(frame, text="出力するUSTファイル", padding="5")
+        export_frame.pack(fill=tk.X, pady=5)
+        
+        ttk.Checkbutton(export_frame, text="Hybrid (推奨)", variable=self.export_hybrid_var).pack(side=tk.LEFT, padx=5)
+        ttk.Checkbutton(export_frame, text="Wav2Vec2", variable=self.export_w2v2_var).pack(side=tk.LEFT, padx=5)
+        ttk.Checkbutton(export_frame, text="WhisperX", variable=self.export_whisper_var).pack(side=tk.LEFT, padx=5)
+        
+        # Execute button
+        self.start_btn = ttk.Button(frame, text="変換開始", command=self.start_conversion)
+        self.start_btn.pack(pady=10)
+        
+        # Log Text
+        ttk.Label(frame, text="ログ出力:").pack(anchor=tk.W)
+        self.log_text = scrolledtext.ScrolledText(frame, height=15, state='disabled')
+        self.log_text.pack(fill=tk.BOTH, expand=True)
+
+    def on_model_select(self, event):
+        cb = event.widget
+        if cb.get() == "URLを指定してモデル追加":
+            self.ask_custom_model_url(cb)
+            
+    def ask_custom_model_url(self, cb):
+        top = tk.Toplevel(self.root)
+        top.title("カスタムモデルの追加")
+        top.geometry("400x150")
+        top.transient(self.root)
+        top.grab_set()
+        
+        ttk.Label(top, text="Hugging FaceのURLを入力してください:\n(例: https://huggingface.co/author/model)").pack(pady=10)
+        url_var = tk.StringVar()
+        entry = ttk.Entry(top, textvariable=url_var, width=50)
+        entry.pack(padx=10, pady=5)
+        
+        def submit():
+            url = url_var.get().strip()
+            import re
+            match = re.search(r"huggingface\.co/([^/]+/[^/]+)", url)
+            if match:
+                model_name = match.group(1)
+                model_name = model_name.split('/tree')[0]
+                model_name = model_name.split('?')[0]
+                
+                values = list(cb['values'])
+                values.insert(-1, model_name)
+                cb['values'] = values
+                cb.set(model_name)
+                top.destroy()
+            else:
+                messagebox.showerror("エラー", "正しいHugging FaceのURLを入力してください。", parent=top)
+                
+        def cancel():
+            cb.set(cb['values'][0])
+            top.destroy()
+            
+        btn_frame = ttk.Frame(top)
+        btn_frame.pack(pady=10)
+        ttk.Button(btn_frame, text="追加", command=submit).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="キャンセル", command=cancel).pack(side=tk.LEFT, padx=5)
+
+    def browse_file(self):
+        filename = filedialog.askopenfilename(
+            title="音声ファイルを選択",
+            filetypes=(("Audio/Video files", "*.wav *.mp3 *.m4a *.mp4 *.flac *.ogg"), ("All files", "*.*"))
+        )
+        if filename:
+            self.audio_file_path.set(filename)
+            base_path = os.path.splitext(filename)[0]
+            self.output_base_path_var.set(base_path)
+
+    def browse_output(self):
+        current_path = self.output_base_path_var.get()
+        initial_dir = os.path.dirname(current_path) if current_path else ""
+        initial_file = os.path.basename(current_path) if current_path else ""
+        
+        filename = filedialog.asksaveasfilename(
+            title="出力ベースパスを選択",
+            initialdir=initial_dir,
+            initialfile=initial_file,
+            defaultextension="",
+            filetypes=(("USTファイル", "*.ust"), ("All files", "*.*"))
+        )
+        if filename:
+            if filename.lower().endswith(".ust"):
+                filename = filename[:-4]
+            self.output_base_path_var.set(filename)
+
+    def start_conversion(self):
+        audio_file = self.audio_file_path.get()
+        if not audio_file or not os.path.exists(audio_file):
+            messagebox.showerror("エラー", "有効な音声ファイルを選択してください。")
+            return
+            
+        tempo_str = self.tempo_var.get().strip()
+        user_tempo = None
+        if tempo_str:
+            try:
+                user_tempo = float(tempo_str)
+            except ValueError:
+                messagebox.showerror("エラー", "BPMは数値を入力してください。")
+                return
+                
+        duration_str = self.min_duration_var.get().strip()
+        min_duration = 0.03
+        if duration_str:
+            try:
+                min_duration = float(duration_str)
+            except ValueError:
+                messagebox.showerror("エラー", "最小ノート長は数値を入力してください。")
+                return
+
+        try:
+            unvoiced_threshold_frames = int(self.unvoiced_threshold_var.get().strip())
+            frame_period = float(self.frame_period_var.get().strip())
+            low_pitch_threshold = int(self.low_pitch_threshold_var.get().strip())
+            low_pitch_drop_amount = int(self.low_pitch_drop_amount_var.get().strip())
+            top_db = float(self.top_db_var.get().strip())
+            skip_b_cost = float(self.skip_b_cost_var.get().strip())
+            last_mora_ratio = float(self.last_mora_ratio_var.get().strip())
+        except ValueError:
+            messagebox.showerror("エラー", "詳細設定の各項目には正しい数値を入力してください。")
+            return
+            
+        whisper_model_name = self.whisper_model_var.get().strip()
+        w2v2_model_name = self.w2v2_model_var.get().strip()
+        f0_model = self.f0_model_var.get().strip()
+                
+        export_hybrid = self.export_hybrid_var.get()
+        export_w2v2 = self.export_w2v2_var.get()
+        export_whisper = self.export_whisper_var.get()
+        
+        if not (export_hybrid or export_w2v2 or export_whisper):
+            messagebox.showerror("エラー", "少なくとも1つの出力USTファイルを選択してください。")
+            return
+            
+        output_base = self.output_base_path_var.get().strip()
+        if not output_base:
+            messagebox.showerror("エラー", "出力ベースパスを指定してください。")
+            return
+            
+        existing_files = []
+        if export_hybrid and os.path.exists(f"{output_base}_hybrid.ust"):
+            existing_files.append(f"{output_base}_hybrid.ust")
+        if export_w2v2 and os.path.exists(f"{output_base}_wav2vec2.ust"):
+            existing_files.append(f"{output_base}_wav2vec2.ust")
+        if export_whisper and os.path.exists(f"{output_base}_whisper.ust"):
+            existing_files.append(f"{output_base}_whisper.ust")
+            
+        if existing_files:
+            msg = "以下のファイルが既に存在します。上書きしますか？\n\n" + "\n".join(existing_files)
+            if not messagebox.askyesno("上書き確認", msg):
+                return
+                
+        self.start_btn.config(state=tk.DISABLED)
+        self.log_text.configure(state='normal')
+        self.log_text.delete(1.0, tk.END)
+        self.log_text.configure(state='disabled')
+        print(f"変換処理を開始します: {audio_file}")
+        
+        # 別スレッドで処理を実行（GUIのフリーズ防止）
+        threading.Thread(target=self.run_conversion_thread, args=(audio_file, output_base, user_tempo, min_duration, export_hybrid, export_w2v2, export_whisper,
+                                                                   unvoiced_threshold_frames, frame_period, low_pitch_threshold, low_pitch_drop_amount, top_db, skip_b_cost, last_mora_ratio,
+                                                                   whisper_model_name, w2v2_model_name, f0_model), daemon=True).start()
+
+    def run_conversion_thread(self, audio_file, output_base, user_tempo, min_duration, export_hybrid, export_w2v2, export_whisper,
+                              unvoiced_threshold_frames, frame_period, low_pitch_threshold, low_pitch_drop_amount, top_db, skip_b_cost, last_mora_ratio,
+                              whisper_model_name, w2v2_model_name, f0_model):
+        try:
+            run_conversion(audio_file, output_base, user_tempo, min_duration, export_hybrid, export_w2v2, export_whisper,
+                           unvoiced_threshold_frames=unvoiced_threshold_frames, frame_period=frame_period,
+                           low_pitch_threshold=low_pitch_threshold, low_pitch_drop_amount=low_pitch_drop_amount,
+                           top_db=top_db, skip_b_cost=skip_b_cost, last_mora_ratio=last_mora_ratio,
+                           whisper_model_name=whisper_model_name, w2v2_model_name=w2v2_model_name, f0_model=f0_model)
+        except Exception as e:
+            import traceback
+            print(f"\nエラーが発生しました:\n{traceback.format_exc()}")
+        finally:
+            self.root.after(0, lambda: self.start_btn.config(state=tk.NORMAL))
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = OToVoApp(root)
+    root.mainloop()
