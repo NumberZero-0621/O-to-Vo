@@ -1256,6 +1256,228 @@ def export_to_svp(ust_notes, output_path, tempo=170):
     except Exception as e:
         print(f"エラー: SVPファイルの書き出しに失敗しました。\n{e}")
 
+def export_to_vsqx(ust_notes, output_path, tempo=170):
+    import xml.etree.ElementTree as ET
+    import xml.dom.minidom as minidom
+    import numpy as np
+
+    print(f"VSQXファイルを書き出し中: {output_path}")
+    if not ust_notes:
+        print("警告: 書き出せるノートがありません。")
+        return
+
+    def sub(parent, tag, text=None, cdata=False):
+        elem = ET.SubElement(parent, tag)
+        if text is not None:
+            if cdata:
+                # 後で置換してCDATAにするためのプレースホルダー
+                elem.text = f"__CDATA_START__{text}__CDATA_END__"
+            else:
+                elem.text = str(text)
+        return elem
+
+    root = ET.Element("vsq4", {
+        "xmlns": "http://www.yamaha.co.jp/vocaloid/schema/vsq4/",
+        "xmlns:xsi": "http://www.w3.org/2001/XMLSchema-instance",
+        "xsi:schemaLocation": "http://www.yamaha.co.jp/vocaloid/schema/vsq4/ vsq4.xsd"
+    })
+
+    sub(root, "vender", "Yamaha corporation", True)
+    sub(root, "version", "4.0.0.3", True)
+
+    vVoiceTable = sub(root, "vVoiceTable")
+    vVoice = sub(vVoiceTable, "vVoice")
+    sub(vVoice, "bs", "0")
+    sub(vVoice, "pc", "0")
+    sub(vVoice, "id", "BMLTD846MLYP2MEK", True)
+    sub(vVoice, "name", "O-to-Vo Singer", True)
+    vPrm = sub(vVoice, "vPrm")
+    for prm in ["bre", "bri", "cle", "gen", "ope"]:
+        sub(vPrm, prm, "0")
+
+    mixer = sub(root, "mixer")
+    masterUnit = sub(mixer, "masterUnit")
+    sub(masterUnit, "oDev", "0")
+    sub(masterUnit, "rLvl", "0")
+    sub(masterUnit, "vol", "0")
+    vsUnit = sub(mixer, "vsUnit")
+    sub(vsUnit, "tNo", "0")
+    sub(vsUnit, "iGin", "0")
+    sub(vsUnit, "sLvl", "-898")
+    sub(vsUnit, "sEnable", "0")
+    sub(vsUnit, "m", "0")
+    sub(vsUnit, "s", "0")
+    sub(vsUnit, "pan", "64")
+    sub(vsUnit, "vol", "0")
+    
+    monoUnit = sub(mixer, "monoUnit")
+    sub(monoUnit, "iGin", "0")
+    sub(monoUnit, "sLvl", "-898")
+    sub(monoUnit, "sEnable", "0")
+    sub(monoUnit, "m", "0")
+    sub(monoUnit, "s", "0")
+    sub(monoUnit, "pan", "64")
+    sub(monoUnit, "vol", "0")
+    
+    stUnit = sub(mixer, "stUnit")
+    sub(stUnit, "iGin", "0")
+    sub(stUnit, "m", "0")
+    sub(stUnit, "s", "0")
+    sub(stUnit, "vol", "-129")
+
+    masterTrack = sub(root, "masterTrack")
+    sub(masterTrack, "seqName", "O-to-Vo Export", True)
+    sub(masterTrack, "comment", "Exported by O-to-Vo", True)
+    sub(masterTrack, "resolution", "480")
+    sub(masterTrack, "preMeasure", "1")
+    
+    timeSig = sub(masterTrack, "timeSig")
+    sub(timeSig, "m", "0")
+    sub(timeSig, "nu", "4")
+    sub(timeSig, "de", "4")
+    
+    tempo_elem = sub(masterTrack, "tempo")
+    sub(tempo_elem, "t", "0")
+    sub(tempo_elem, "v", str(int(tempo * 100)))
+
+    vsTrack = sub(root, "vsTrack")
+    sub(vsTrack, "tNo", "0")
+    sub(vsTrack, "name", "Track 1", True)
+    sub(vsTrack, "comment", "Track", True)
+    
+    vsPart = sub(vsTrack, "vsPart")
+    sub(vsPart, "t", "1920")
+    playTime = sub(vsPart, "playTime", "0")
+    sub(vsPart, "name", "O-to-Vo Part", True)
+    sub(vsPart, "comment", "", True)
+    
+    sPlug = sub(vsPart, "sPlug")
+    sub(sPlug, "id", "ACA9C502-A04B-42b5-B2EB-5CEA36D16FCE", True)
+    sub(sPlug, "name", "VOCALOID2 Compatible Style", True)
+    sub(sPlug, "version", "3.0.0.1", True)
+    
+    pStyle = sub(vsPart, "pStyle")
+    for k, v in [("accent", 50), ("bendDep", 8), ("bendLen", 0), ("decay", 50), ("fallPort", 0), ("opening", 127), ("risePort", 0)]:
+        elem = sub(pStyle, "v", v)
+        elem.set("id", k)
+        
+    singer = sub(vsPart, "singer")
+    sub(singer, "t", "0")
+    sub(singer, "bs", "0")
+    sub(singer, "pc", "0")
+
+    ticks_per_second = (tempo * 480) / 60.0
+    max_tick = 0
+    
+    note_elements = []
+    cc_elements = []
+    
+    for note in ust_notes:
+        start_tick = int(round(note["start"] * ticks_per_second))
+        end_tick = int(round(note["end"] * ticks_per_second))
+        dur_tick = end_tick - start_tick
+        
+        if dur_tick <= 0:
+            continue
+            
+        lyric = note.get("text", "a")
+        if lyric == "R":
+            continue
+            
+        base_pitch = int(note["pitch"])
+        
+        note_elem = ET.Element("note")
+        sub(note_elem, "t", start_tick)
+        sub(note_elem, "dur", dur_tick)
+        sub(note_elem, "n", base_pitch)
+        sub(note_elem, "v", "64")
+        sub(note_elem, "y", lyric, True)
+        sub(note_elem, "p", "a", True)
+        
+        nStyle = sub(note_elem, "nStyle")
+        for k, v in [("accent", 50), ("bendDep", 0), ("bendLen", 0), ("decay", 50), ("fallPort", 0), ("opening", 127), ("risePort", 0), ("vibLen", 0), ("vibType", 0)]:
+            elem = sub(nStyle, "v", v)
+            elem.set("id", k)
+            
+        note_elements.append(note_elem)
+        
+        max_tick = max(max_tick, end_tick)
+        
+        pitch_curve = note.get("pitch_curve", [])
+        if pitch_curve:
+            valid_indices = [i for i, p in enumerate(pitch_curve) if not np.isnan(p)]
+            if valid_indices:
+                filled_curve = []
+                for i in range(len(pitch_curve)):
+                    if not np.isnan(pitch_curve[i]):
+                        filled_curve.append(pitch_curve[i])
+                    else:
+                        nearest_idx = min(valid_indices, key=lambda x: abs(x - i))
+                        filled_curve.append(pitch_curve[nearest_idx])
+                        
+                max_diff = max(abs(p - base_pitch) for p in filled_curve)
+                pbs_val = max(2, int(np.ceil(max_diff)))
+                
+                cc_s = ET.Element("cc")
+                sub(cc_s, "t", start_tick)
+                elem = sub(cc_s, "v", str(pbs_val))
+                elem.set("id", "S")
+                cc_elements.append(cc_s)
+                
+                total_points = len(filled_curve)
+                for i, p in enumerate(filled_curve):
+                    pt_tick = start_tick + int((i / total_points) * dur_tick)
+                    delta_semi = p - base_pitch
+                    pit_val = int(round(delta_semi * (8192.0 / pbs_val)))
+                    pit_val = max(-8192, min(8191, pit_val))
+                    
+                    cc_p = ET.Element("cc")
+                    sub(cc_p, "t", pt_tick)
+                    elem = sub(cc_p, "v", pit_val)
+                    elem.set("id", "P")
+                    cc_elements.append(cc_p)
+                
+                # ノート終了時にピッチベンドをリセット（次のノートへの影響を防ぐ）
+                cc_reset = ET.Element("cc")
+                sub(cc_reset, "t", end_tick)
+                elem = sub(cc_reset, "v", "0")
+                elem.set("id", "P")
+                cc_elements.append(cc_reset)
+
+    cc_elements.sort(key=lambda x: int(x.find("t").text))
+    note_elements.sort(key=lambda x: int(x.find("t").text))
+    
+    for cc_elem in cc_elements:
+        vsPart.append(cc_elem)
+    for note_elem in note_elements:
+        vsPart.append(note_elem)
+        
+    sub(vsPart, "plane", "0")
+
+    playTime.text = str(max_tick + 480)
+    
+    monoTrack = sub(root, "monoTrack")
+    stTrack = sub(root, "stTrack")
+    aux = sub(root, "aux")
+    sub(aux, "id", "AUX_VST_HOST_CHUNK_INFO", True)
+    sub(aux, "content", "VlNDSwAAAAADAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", True)
+    
+    xml_str = ET.tostring(root, encoding="utf-8").decode("utf-8")
+    xml_str = xml_str.replace("__CDATA_START__", "<![CDATA[")
+    xml_str = xml_str.replace("__CDATA_END__", "]]>")
+    
+    parsed = minidom.parseString(xml_str)
+    pretty_xml = parsed.toprettyxml(indent="  ")
+    pretty_xml = "\n".join([line for line in pretty_xml.split("\n") if line.strip()])
+    pretty_xml = pretty_xml.replace('<?xml version="1.0" ?>', '<?xml version="1.0" encoding="UTF-8" standalone="no"?>')
+
+    try:
+        with open(output_path, "w", encoding="utf-8", newline='\n') as f:
+            f.write(pretty_xml)
+        print(f"成功: {output_path} が生成されました。")
+    except Exception as e:
+        print(f"エラー: VSQXファイルの書き出しに失敗しました。\n{e}")
+
 def estimate_tempo(audio_path, default_tempo=120):
     print("BPM(テンポ)を自動推定中...")
     try:
@@ -1500,7 +1722,7 @@ def run_conversion(audio_file, output_base_path, user_specified_tempo, min_durat
             elif fmt == "svp":
                 export_to_svp(notes_data, out_path, tempo=target_tempo)
             elif fmt == "vsqx":
-                print(f"Warning: Vsqx export is not yet implemented ({out_path})")
+                export_to_vsqx(notes_data, out_path, tempo=target_tempo)
             elif fmt == "ccs":
                 print(f"Warning: Ccs export is not yet implemented ({out_path})")
             elif fmt == "tssln":
