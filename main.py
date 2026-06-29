@@ -1266,6 +1266,43 @@ def export_to_vsqx(ust_notes, output_path, tempo=170):
         print("警告: 書き出せるノートがありません。")
         return
 
+    def get_vocaloid_phonemes(lyric):
+        mapping = {
+            'あ': 'a', 'い': 'i', 'う': 'M', 'え': 'e', 'お': 'o',
+            'か': 'k a', 'き': "k' i", 'く': 'k M', 'け': 'k e', 'こ': 'k o',
+            'さ': 's a', 'し': 'S i', 'す': 's M', 'せ': 's e', 'そ': 's o',
+            'た': 't a', 'ち': 'tS i', 'つ': 'ts M', 'て': 't e', 'と': 't o',
+            'な': 'n a', 'に': 'J i', 'ぬ': 'n M', 'ね': 'n e', 'の': 'n o',
+            'は': 'h a', 'ひ': 'C i', 'ふ': 'p\\ M', 'へ': 'h e', 'ほ': 'h o',
+            'ま': 'm a', 'み': "m' i", 'む': 'm M', 'め': 'm e', 'も': 'm o',
+            'や': 'j a', 'ゆ': 'j M', 'よ': 'j o',
+            'ら': '4 a', 'り': "4' i", 'る': '4 M', 'れ': '4 e', 'ろ': '4 o',
+            'わ': 'w a', 'を': 'o', 'ん': 'n',
+            'が': 'g a', 'ぎ': "g' i", 'ぐ': 'g M', 'げ': 'g e', 'ご': 'g o',
+            'ざ': 'dz a', 'じ': 'dZ i', 'ず': 'dz M', 'ぜ': 'dz e', 'ぞ': 'dz o',
+            'だ': 'd a', 'ぢ': 'dZ i', 'づ': 'dz M', 'で': 'd e', 'ど': 'd o',
+            'ば': 'b a', 'び': "b' i", 'ぶ': 'b M', 'べ': 'b e', 'ぼ': 'b o',
+            'ぱ': 'p a', 'ぴ': "p' i", 'ぷ': 'p M', 'ぺ': 'p e', 'ぽ': 'p o',
+            'きゃ': "k' a", 'きゅ': "k' M", 'きょ': "k' o",
+            'ぎゃ': "g' a", 'ぎゅ': "g' M", 'ぎょ': "g' o",
+            'しゃ': 'S a', 'しゅ': 'S M', 'しょ': 'S o',
+            'じゃ': 'dZ a', 'じゅ': 'dZ M', 'じょ': 'dZ o',
+            'ちゃ': 'tS a', 'ちゅ': 'tS M', 'ちょ': 'tS o',
+            'にゃ': 'J a', 'にゅ': 'J M', 'にょ': 'J o',
+            'ひゃ': 'C a', 'ひゅ': 'C M', 'ひょ': 'C o',
+            'びゃ': "b' a", 'びゅ': "b' M", 'びょ': "b' o",
+            'ぴゃ': "p' a", 'ぴゅ': "p' M", 'ぴょ': "p' o",
+            'みゃ': "m' a", 'みゅ': "m' M", 'みょ': "m' o",
+            'りゃ': "4' a", 'りゅ': "4' M", 'りょ': "4' o",
+            'ふぁ': 'p\\ a', 'ふぃ': 'p\\ i', 'ふぇ': 'p\\ e', 'ふぉ': 'p\\ o',
+            'てぃ': "t' i", 'でぃ': "d' i", 'とぅ': 't M', 'どぅ': 'd M',
+            'うぇ': 'w e', 'うぃ': 'w i', 'つぁ': 'ts a', 'つぃ': 'ts i', 'つぇ': 'ts e', 'つぉ': 'ts o',
+            'ー': '-'
+        }
+        # カタカナをひらがなに変換（長音記号などはそのまま）
+        hiragana = "".join(chr(ord(c) - 0x60) if 0x30A1 <= ord(c) <= 0x30F6 else c for c in lyric)
+        return mapping.get(hiragana, 'a')
+
     def sub(parent, tag, text=None, cdata=False):
         elem = ET.SubElement(parent, tag)
         if text is not None:
@@ -1290,7 +1327,7 @@ def export_to_vsqx(ust_notes, output_path, tempo=170):
     sub(vVoice, "bs", "0")
     sub(vVoice, "pc", "0")
     sub(vVoice, "id", "BMLTD846MLYP2MEK", True)
-    sub(vVoice, "name", "O-to-Vo Singer", True)
+    sub(vVoice, "name", "VY2V3", True)
     vPrm = sub(vVoice, "vPrm")
     for prm in ["bre", "bri", "cle", "gen", "ope"]:
         sub(vPrm, prm, "0")
@@ -1326,8 +1363,8 @@ def export_to_vsqx(ust_notes, output_path, tempo=170):
     sub(stUnit, "vol", "-129")
 
     masterTrack = sub(root, "masterTrack")
-    sub(masterTrack, "seqName", "O-to-Vo Export", True)
-    sub(masterTrack, "comment", "Exported by O-to-Vo", True)
+    sub(masterTrack, "seqName", "Untitled0", True)
+    sub(masterTrack, "comment", "New VSQ File", True)
     sub(masterTrack, "resolution", "480")
     sub(masterTrack, "preMeasure", "1")
     
@@ -1349,7 +1386,7 @@ def export_to_vsqx(ust_notes, output_path, tempo=170):
     sub(vsPart, "t", "1920")
     playTime = sub(vsPart, "playTime", "0")
     sub(vsPart, "name", "O-to-Vo Part", True)
-    sub(vsPart, "comment", "", True)
+    sub(vsPart, "comment", "O-to-Vo Part", True)
     
     sPlug = sub(vsPart, "sPlug")
     sub(sPlug, "id", "ACA9C502-A04B-42b5-B2EB-5CEA36D16FCE", True)
@@ -1370,7 +1407,8 @@ def export_to_vsqx(ust_notes, output_path, tempo=170):
     max_tick = 0
     
     note_elements = []
-    cc_elements = []
+    cc_s_events = {}
+    cc_p_events = {}
     
     for note in ust_notes:
         start_tick = int(round(note["start"] * ticks_per_second))
@@ -1392,7 +1430,9 @@ def export_to_vsqx(ust_notes, output_path, tempo=170):
         sub(note_elem, "n", base_pitch)
         sub(note_elem, "v", "64")
         sub(note_elem, "y", lyric, True)
-        sub(note_elem, "p", "a", True)
+        phoneme = get_vocaloid_phonemes(lyric)
+        elem_p = sub(note_elem, "p", phoneme, True)
+        elem_p.set("lock", "1")
         
         nStyle = sub(note_elem, "nStyle")
         for k, v in [("accent", 50), ("bendDep", 0), ("bendLen", 0), ("decay", 50), ("fallPort", 0), ("opening", 127), ("risePort", 0), ("vibLen", 0), ("vibType", 0)]:
@@ -1418,11 +1458,7 @@ def export_to_vsqx(ust_notes, output_path, tempo=170):
                 max_diff = max(abs(p - base_pitch) for p in filled_curve)
                 pbs_val = max(2, int(np.ceil(max_diff)))
                 
-                cc_s = ET.Element("cc")
-                sub(cc_s, "t", start_tick)
-                elem = sub(cc_s, "v", str(pbs_val))
-                elem.set("id", "S")
-                cc_elements.append(cc_s)
+                cc_s_events[start_tick] = pbs_val
                 
                 total_points = len(filled_curve)
                 for i, p in enumerate(filled_curve):
@@ -1431,24 +1467,27 @@ def export_to_vsqx(ust_notes, output_path, tempo=170):
                     pit_val = int(round(delta_semi * (8192.0 / pbs_val)))
                     pit_val = max(-8192, min(8191, pit_val))
                     
-                    cc_p = ET.Element("cc")
-                    sub(cc_p, "t", pt_tick)
-                    elem = sub(cc_p, "v", pit_val)
-                    elem.set("id", "P")
-                    cc_elements.append(cc_p)
+                    cc_p_events[pt_tick] = pit_val
                 
                 # ノート終了時にピッチベンドをリセット（次のノートへの影響を防ぐ）
-                cc_reset = ET.Element("cc")
-                sub(cc_reset, "t", end_tick)
-                elem = sub(cc_reset, "v", "0")
-                elem.set("id", "P")
-                cc_elements.append(cc_reset)
+                cc_p_events[end_tick] = 0
 
-    cc_elements.sort(key=lambda x: int(x.find("t").text))
+    # 重複を排除し、時刻順かつグループごとに要素を追加
+    for t in sorted(cc_s_events.keys()):
+        cc_s = ET.Element("cc")
+        sub(cc_s, "t", t)
+        elem = sub(cc_s, "v", str(cc_s_events[t]))
+        elem.set("id", "S")
+        vsPart.append(cc_s)
+        
+    for t in sorted(cc_p_events.keys()):
+        cc_p = ET.Element("cc")
+        sub(cc_p, "t", t)
+        elem = sub(cc_p, "v", str(cc_p_events[t]))
+        elem.set("id", "P")
+        vsPart.append(cc_p)
+
     note_elements.sort(key=lambda x: int(x.find("t").text))
-    
-    for cc_elem in cc_elements:
-        vsPart.append(cc_elem)
     for note_elem in note_elements:
         vsPart.append(note_elem)
         
@@ -1477,6 +1516,126 @@ def export_to_vsqx(ust_notes, output_path, tempo=170):
         print(f"成功: {output_path} が生成されました。")
     except Exception as e:
         print(f"エラー: VSQXファイルの書き出しに失敗しました。\n{e}")
+
+def export_to_ccs(ust_notes, output_path, tempo=170):
+    import xml.etree.ElementTree as ET
+    import xml.dom.minidom as minidom
+    import numpy as np
+    import math
+
+    print(f"CCSファイルを書き出し中: {output_path}")
+    if not ust_notes:
+        print("警告: 書き出せるノートがありません。")
+        return
+
+    def sub(parent, tag, text=None, **kwargs):
+        elem = ET.SubElement(parent, tag, **kwargs)
+        if text is not None:
+            elem.text = str(text)
+        return elem
+
+    root = ET.Element("Scenario", Code="7251BC4B6168E7B2992FA620BD3E1E77")
+    generation = sub(root, "Generation")
+    sub(generation, "Author", Version="3.2.21.2")
+    tts = sub(generation, "TTS", Version="3.1.0")
+    sub(tts, "Dictionary", Version="1.4.0")
+    sub(tts, "SoundSources")
+    svss = sub(generation, "SVSS", Version="3.0.5")
+    sub(svss, "Dictionary", Version="1.0.0")
+    sound_sources = sub(svss, "SoundSources")
+    sub(sound_sources, "SoundSource", Version="1.0.0", Id="XSV-JPM-P", Name="O-to-Vo")
+
+    sequence = sub(root, "Sequence", Id="")
+    scene = sub(sequence, "Scene", Id="")
+    units = sub(scene, "Units")
+    unit = sub(units, "Unit", Version="1.0", Id="", Category="SingerSong", Group="5041941f-7111-4049-a470-31971092d202", StartTime="00:00:00", Duration="00:10:00", CastId="XSV-JPM-P", Language="Japanese")
+    song = sub(unit, "Song", Version="1.02")
+    tempo_elem = sub(song, "Tempo")
+    sub(tempo_elem, "Sound", Clock="0", Tempo=f"{tempo:.2f}")
+    beat = sub(song, "Beat")
+    sub(beat, "Time", Clock="0", Beats="4", BeatType="4")
+    score = sub(song, "Score")
+    sub(score, "Key", Clock="0", Fifths="0", Mode="0")
+
+    ticks_per_second = (tempo * 960) / 60.0
+    frame_period = 0.005 
+
+    param = sub(song, "Parameter")
+    logf0_elem = sub(param, "LogF0")
+    logf0_data = {}
+
+    for note in ust_notes:
+        start_tick = int(round(note["start"] * ticks_per_second))
+        end_tick = int(round(note["end"] * ticks_per_second))
+        dur_tick = end_tick - start_tick
+        
+        if dur_tick <= 0:
+            continue
+            
+        lyric = note.get("text", "a")
+        if lyric == "R":
+            continue
+            
+        base_pitch = int(note["pitch"])
+        pitch_octave = (base_pitch // 12) - 1
+        pitch_step = base_pitch % 12
+        
+        hiragana = "".join(chr(ord(c) - 0x60) if 0x30A1 <= ord(c) <= 0x30F6 else c for c in lyric)
+        if hiragana == "-": hiragana = "ー"
+        
+        sub(score, "Note", Clock=str(start_tick), PitchStep=str(pitch_step), PitchOctave=str(pitch_octave), Duration=str(dur_tick), Lyric=hiragana)
+        
+        pitch_curve = note.get("pitch_curve", [])
+        if pitch_curve:
+            valid_indices = [i for i, p in enumerate(pitch_curve) if not np.isnan(p)]
+            if valid_indices:
+                filled_curve = []
+                for i in range(len(pitch_curve)):
+                    if not np.isnan(pitch_curve[i]):
+                        filled_curve.append(pitch_curve[i])
+                    else:
+                        nearest_idx = min(valid_indices, key=lambda x: abs(x - i))
+                        filled_curve.append(pitch_curve[nearest_idx])
+                        
+                total_points = len(filled_curve)
+                for i, p in enumerate(filled_curve):
+                    time_sec = note["start"] + (i / total_points) * (note["end"] - note["start"])
+                    frame_idx = int(round(time_sec / frame_period))
+                    
+                    f0_hz = 440.0 * (2.0 ** ((p - 69.0) / 12.0))
+                    if f0_hz > 0:
+                        logf0_data[frame_idx] = math.log(f0_hz)
+
+    if logf0_data:
+        max_idx = max(logf0_data.keys())
+        logf0_elem.set("Length", str(max_idx + 1))
+        
+        sorted_indices = sorted(logf0_data.keys())
+        last_idx = -2
+        for idx in sorted_indices:
+            val = logf0_data[idx]
+            if idx == last_idx + 1:
+                sub(logf0_elem, "Data", text=str(val))
+            else:
+                sub(logf0_elem, "Data", text=str(val), Index=str(idx))
+            last_idx = idx
+
+    groups = sub(scene, "Groups")
+    sub(groups, "Group", Version="1.0", Id="5041941f-7111-4049-a470-31971092d202", Category="SingerSong", Name="vocal_hybrid", Color="#FFAF1F14", Volume="0", Pan="0", IsSolo="false", IsMuted="false", CastId="XSV-JPM-P", Language="Japanese")
+    sub(scene, "SoundSetting", Rhythm="4/4", Tempo=str(int(tempo)))
+
+    xml_str = ET.tostring(root, encoding="utf-8").decode("utf-8")
+    parsed = minidom.parseString(xml_str)
+    pretty_xml = parsed.toprettyxml(indent="  ")
+    pretty_xml = "\n".join([line for line in pretty_xml.split("\n") if line.strip()])
+    pretty_xml = pretty_xml.replace('<?xml version="1.0" ?>', '<?xml version="1.0" encoding="utf-8"?>')
+
+    try:
+        with open(output_path, "w", encoding="utf-8", newline='\n') as f:
+            f.write(pretty_xml)
+        print(f"成功: {output_path} が生成されました。")
+    except Exception as e:
+        print(f"エラー: CCSファイルの書き出しに失敗しました。\n{e}")
 
 def estimate_tempo(audio_path, default_tempo=120):
     print("BPM(テンポ)を自動推定中...")
@@ -1724,7 +1883,7 @@ def run_conversion(audio_file, output_base_path, user_specified_tempo, min_durat
             elif fmt == "vsqx":
                 export_to_vsqx(notes_data, out_path, tempo=target_tempo)
             elif fmt == "ccs":
-                print(f"Warning: Ccs export is not yet implemented ({out_path})")
+                export_to_ccs(notes_data, out_path, tempo=target_tempo)
             elif fmt == "tssln":
                 print(f"Warning: Tssln export is not yet implemented ({out_path})")
 
@@ -1759,8 +1918,8 @@ class ThreadSafeTextRedirector:
 class OToVoApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("O-to-Vo (Audio to UST Converter)")
-        self.root.geometry("650x600")
+        self.root.title("O-to-Vo")
+        self.root.geometry("650x750")
         
         self.audio_file_path = tk.StringVar()
         self.output_base_path_var = tk.StringVar()
@@ -1780,13 +1939,13 @@ class OToVoApp:
         self.export_w2v2_var = tk.BooleanVar(value=False)
         self.export_whisper_var = tk.BooleanVar(value=False)
         
-        self.fmt_ust_var = tk.BooleanVar(value=True)
+        self.fmt_ust_var = tk.BooleanVar(value=False)
         self.fmt_musicxml_var = tk.BooleanVar(value=False)
         self.fmt_svp_var = tk.BooleanVar(value=False)
         self.fmt_vsqx_var = tk.BooleanVar(value=False)
         self.fmt_ccs_var = tk.BooleanVar(value=False)
         self.fmt_tssln_var = tk.BooleanVar(value=False)
-        self.fmt_midi_var = tk.BooleanVar(value=False)
+        self.fmt_midi_var = tk.BooleanVar(value=True)
         
         self.create_widgets()
         
@@ -1882,13 +2041,12 @@ class OToVoApp:
         format_frame = ttk.LabelFrame(frame, text="出力フォーマット", padding="5")
         format_frame.pack(fill=tk.X, pady=5)
         
-        ttk.Checkbutton(format_frame, text="UST", variable=self.fmt_ust_var).pack(side=tk.LEFT, padx=5)
-        ttk.Checkbutton(format_frame, text="MusicXML", variable=self.fmt_musicxml_var).pack(side=tk.LEFT, padx=5)
-        ttk.Checkbutton(format_frame, text="Svp", variable=self.fmt_svp_var).pack(side=tk.LEFT, padx=5)
-        ttk.Checkbutton(format_frame, text="Vsqx", variable=self.fmt_vsqx_var).pack(side=tk.LEFT, padx=5)
-        ttk.Checkbutton(format_frame, text="Ccs", variable=self.fmt_ccs_var).pack(side=tk.LEFT, padx=5)
-        ttk.Checkbutton(format_frame, text="Tssln", variable=self.fmt_tssln_var).pack(side=tk.LEFT, padx=5)
         ttk.Checkbutton(format_frame, text="MIDI", variable=self.fmt_midi_var).pack(side=tk.LEFT, padx=5)
+        ttk.Checkbutton(format_frame, text="MusicXML", variable=self.fmt_musicxml_var).pack(side=tk.LEFT, padx=5)
+        ttk.Checkbutton(format_frame, text="Vsqx", variable=self.fmt_vsqx_var).pack(side=tk.LEFT, padx=5)
+        ttk.Checkbutton(format_frame, text="UST", variable=self.fmt_ust_var).pack(side=tk.LEFT, padx=5)
+        ttk.Checkbutton(format_frame, text="Ccs", variable=self.fmt_ccs_var).pack(side=tk.LEFT, padx=5)
+        ttk.Checkbutton(format_frame, text="Svp", variable=self.fmt_svp_var).pack(side=tk.LEFT, padx=5)
         
         # Execute button
         self.start_btn = ttk.Button(frame, text="変換開始", command=self.start_conversion)
@@ -2023,7 +2181,6 @@ class OToVoApp:
         if self.fmt_svp_var.get(): output_formats.append("svp")
         if self.fmt_vsqx_var.get(): output_formats.append("vsqx")
         if self.fmt_ccs_var.get(): output_formats.append("ccs")
-        if self.fmt_tssln_var.get(): output_formats.append("tssln")
         if self.fmt_midi_var.get(): output_formats.append("midi")
         
         if not output_formats:
