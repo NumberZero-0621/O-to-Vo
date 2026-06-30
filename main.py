@@ -303,10 +303,128 @@ def process_wav2vec2_ctc_chunk(audio_path, model, processor, device, offset_seco
     char_segments = [s for s in char_segments if s["text"].strip() and s["text"] not in exclude_chars]
     return char_segments
 
+def compute_forced_alignment(audio_path, whisper_segments, model, processor, device, offset_seconds=0.0):
+    audio, sr = librosa.load(audio_path, sr=16000)
+    inputs = processor(audio, sampling_rate=16000, return_tensors="pt", padding=True).to(device)
+    
+    with torch.no_grad():
+        logits = model(inputs.input_values).logits
+        
+    log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+    vocab = processor.tokenizer.get_vocab()
+    blank_id = processor.tokenizer.pad_token_id
+    id_to_token = {v: k for k, v in vocab.items()}
+    
+    tokens = []
+    token_to_whisper_seg = []
+    for seg in whisper_segments:
+        for char in seg["text"]:
+            if char in vocab:
+                tokens.append(vocab[char])
+                token_to_whisper_seg.append(seg)
+            elif char.replace('|', '') in vocab:
+                tokens.append(vocab[char.replace('|', '')])
+                token_to_whisper_seg.append(seg)
+                
+    if not tokens:
+        return []
+        
+    targets = torch.tensor(tokens, dtype=torch.int32).unsqueeze(0).to(device)
+    
+    try:
+        aligned_path, _ = torchaudio.functional.forced_align(log_probs, targets, blank=blank_id)
+        aligned_path = aligned_path[0].cpu().numpy()
+    except Exception as e:
+        print(f"Forced alignment failed: {e}")
+        return []
+        
+    frame_duration = 0.02
+    char_segments = []
+    
+    target_idx = 0
+    current_char_start_frame = -1
+    
+    for i, token_id in enumerate(aligned_path):
+        if target_idx < len(tokens):
+            expected_token = tokens[target_idx]
+        else:
+            break
+            
+        if token_id == expected_token:
+            if current_char_start_frame == -1:
+                current_char_start_frame = i
+        else:
+            if current_char_start_frame != -1:
+                end_frame = i
+                char_text = id_to_token[expected_token].replace('|', '')
+                char_segments.append({
+                    "text": char_text,
+                    "start": current_char_start_frame * frame_duration + offset_seconds,
+                    "end": end_frame * frame_duration + offset_seconds
+                })
+                current_char_start_frame = -1
+                target_idx += 1
+                
+                if token_id != blank_id and target_idx < len(tokens) and token_id == tokens[target_idx]:
+                    current_char_start_frame = i
+
+    if current_char_start_frame != -1 and target_idx < len(tokens):
+        char_text = id_to_token[tokens[target_idx]].replace('|', '')
+        char_segments.append({
+            "text": char_text,
+            "start": current_char_start_frame * frame_duration + offset_seconds,
+            "end": len(aligned_path) * frame_duration + offset_seconds
+        })
+        
+    return char_segments
+
+def refine_note_boundaries_with_dtw(aligned_chars, time_array, confidence_array):
+    if not aligned_chars or len(time_array) == 0:
+        return aligned_chars
+        
+    synthetic_env = np.zeros(len(time_array))
+    for seg in aligned_chars:
+        s_idx = np.searchsorted(time_array, seg["start"])
+        e_idx = np.searchsorted(time_array, seg["end"])
+        if s_idx < len(synthetic_env):
+            e_idx = min(e_idx, len(synthetic_env))
+            synthetic_env[s_idx:e_idx] = 1.0
+            
+    try:
+        import librosa
+        D, wp = librosa.sequence.dtw(X=synthetic_env.reshape(1, -1), Y=confidence_array.reshape(1, -1))
+        
+        mapping = {}
+        for x, y in wp:
+            if x not in mapping:
+                mapping[x] = []
+            mapping[x].append(y)
+            
+        for x in mapping:
+            mapping[x] = int(np.mean(mapping[x]))
+            
+        refined_chars = []
+        for seg in aligned_chars:
+            s_idx = np.searchsorted(time_array, seg["start"])
+            e_idx = np.searchsorted(time_array, seg["end"])
+            
+            s_idx_new = mapping.get(s_idx, s_idx)
+            e_idx_new = mapping.get(min(e_idx, len(time_array)-1), min(e_idx, len(time_array)-1))
+            
+            refined_chars.append({
+                "text": seg["text"],
+                "start": time_array[s_idx_new] if s_idx_new < len(time_array) else seg["start"],
+                "end": time_array[e_idx_new] if e_idx_new < len(time_array) else seg["end"]
+            })
+        return refined_chars
+    except Exception as e:
+        print(f"DTW refinement failed: {e}")
+        return aligned_chars
+
 # ==========================================
 # 2. ピッチ連続データを取得 (PyWorld / CREPE)
 # ==========================================
-def get_pitch_contour(audio_path, frame_period=10.0, f0_model="PyWorld"):
+def get_pitch_contour(audio_path, frame_period=10.0, f0_model="PyWorld", pyworld_silence_threshold=-40.0):
     print(f"{f0_model} でピッチ解析を実行中...")
     
     sr, audio = wavfile.read(audio_path)
@@ -370,7 +488,16 @@ def get_pitch_contour(audio_path, frame_period=10.0, f0_model="PyWorld"):
         
         # harvestでF0推定
         f0, time = pw.harvest(audio, sr, frame_period=frame_period)
-        confidence = (f0 > 0).astype(float)
+        
+        # 音量（RMS）を計算し、F0が検出できなくても音量が閾値以上なら有声とする
+        hop_length = int(sr * (frame_period / 1000.0))
+        rms = librosa.feature.rms(y=audio, frame_length=hop_length*2, hop_length=hop_length)[0]
+        if len(rms) < len(f0):
+            rms = np.pad(rms, (0, len(f0) - len(rms)), mode='edge')
+        else:
+            rms = rms[:len(f0)]
+        rms_db = librosa.amplitude_to_db(rms, ref=np.max)
+        confidence = ((f0 > 0) | (rms_db > pyworld_silence_threshold)).astype(float)
     
     # 無音や判定不能時の 0Hz または NaN に対して処理
     f0_safe = np.copy(f0)
@@ -514,7 +641,7 @@ def align_lyrics_to_timings(whisper_chars, w2v2_chars, skip_b_cost=0.5, last_mor
 # ==========================================
 # 3. ノートの分割と文字の割り当て（ハイブリッド処理）
 # ==========================================
-def segment_and_align_notes(char_segments, time_array, midi_contour, confidence_array, min_duration=0.03, unvoiced_threshold_frames=10, low_pitch_threshold=47, low_pitch_drop_amount=18):
+def segment_and_align_notes(char_segments, time_array, midi_contour, confidence_array, min_duration=0.03, unvoiced_threshold_frames=10, low_pitch_threshold=47, low_pitch_drop_amount=18, pitch_split_threshold_frames=10, pitch_split_fluctuation=0.2, absorb_max_frames=10, enable_pitch_split=False):
     # print("統合タイムライン方式によるノート生成を実行中...")
     
     if len(time_array) == 0:
@@ -531,19 +658,23 @@ def segment_and_align_notes(char_segments, time_array, midi_contour, confidence_
         # この文字の区間に対応するタイムラインのインデックス範囲を特定
         start_idx = np.searchsorted(time_array, char_info["start"])
         end_idx = np.searchsorted(time_array, char_info["end"])
+        
+        # 抽出されたノートが短すぎてPyWorldの1フレーム未満になってしまった場合でも、
+        # 最低1フレームを割り当てることでノートの欠落を防ぐ
+        if start_idx == end_idx and start_idx < len(time_array):
+            end_idx = start_idx + 1
+            
         for idx in range(start_idx, end_idx):
             if idx < len(timeline_texts):
                 timeline_texts[idx] = {"text": char_info["text"], "id": i}
 
-    # ギャップ（Wav2Vec2で検出されなかった有声音区間）を「直前の文字」で埋める
-    # これにより、ピッチが同じであればWav2Vec2の検出タイミングと結合され、1つの長いノートになる
-    last_info = None
-    for i in range(len(timeline_texts)):
-        if timeline_texts[i] is not None:
-            last_info = timeline_texts[i]
-        else:
-            if last_info is not None and confidence_array[i] > 0:
-                timeline_texts[i] = last_info
+    # ギャップ（Wav2Vec2で抽出されなかった母音の余韻など）の補間
+    # 有声音（confidence > 0）が続く限り、直前の文字を後方に延長する。
+    # 無音が挟まった場合は延長をストップするため、休符を飛び越えたゴーストノートは発生しない。
+    for i in range(1, len(timeline_texts)):
+        if timeline_texts[i] is None and timeline_texts[i-1] is not None:
+            if confidence_array[i] > 0:
+                timeline_texts[i] = timeline_texts[i-1]
 
     # 無音（休符）の判定
     # ピッチが取れなかった（無声音/無音）区間が一定時間以上続いた場合、Rest (None) にする
@@ -565,6 +696,99 @@ def segment_and_align_notes(char_segments, time_array, midi_contour, confidence_
         for j in range(len(confidence_array) - current_unvoiced_len, len(confidence_array)):
             timeline_texts[j] = None
 
+    if enable_pitch_split:
+        # 1.5. ピッチ推移に基づく自動分割
+        diff_threshold = pitch_split_fluctuation
+        original_max_id = max((t["id"] for t in timeline_texts if t is not None), default=0)
+        next_new_id = original_max_id + 1
+        
+        i = 0
+        while i < len(timeline_texts):
+            if timeline_texts[i] is None:
+                i += 1
+                continue
+                
+            current_id = timeline_texts[i]["id"]
+            start_idx = i
+            while i < len(timeline_texts) and timeline_texts[i] is not None and timeline_texts[i]["id"] == current_id:
+                i += 1
+            end_idx = i
+            
+            # [start_idx, end_idx) の区間でピッチをチェック
+            pitches = midi_contour[start_idx:end_idx]
+            valid_pitches = pitches[~np.isnan(pitches)]
+            if len(valid_pitches) > 0:
+                rounded_pitches = np.round(valid_pitches).astype(int)
+                rounded_pitches = rounded_pitches[rounded_pitches >= 0]
+                if len(rounded_pitches) > 0:
+                    counts = np.bincount(rounded_pitches)
+                    base_pitch = int(np.argmax(counts))
+                    
+                    # 安定セグメントを探索
+                    segments = []
+                    current_segment = []
+                    for j, p in enumerate(pitches):
+                        if np.isnan(p):
+                            if current_segment:
+                                segments.append(current_segment)
+                                current_segment = []
+                            continue
+                        
+                        if not current_segment:
+                            current_segment.append(j)
+                        else:
+                            prev_p = pitches[current_segment[-1]]
+                            if abs(p - prev_p) < diff_threshold:
+                                current_segment.append(j)
+                            else:
+                                segments.append(current_segment)
+                                current_segment = [j]
+                    if current_segment:
+                        segments.append(current_segment)
+                        
+                    for seg in segments:
+                        if len(seg) >= pitch_split_threshold_frames:
+                            seg_pitches = pitches[seg]
+                            seg_median = np.median(seg_pitches)
+                            if abs(seg_median - base_pitch) >= diff_threshold:
+                                # 分割実行
+                                for j in seg:
+                                    original_text = timeline_texts[start_idx]["text"]
+                                    vowel_text = get_vowel(original_text)
+                                    timeline_texts[start_idx + j] = {"text": vowel_text, "id": next_new_id}
+                                next_new_id += 1
+
+        # 1.6. 短いノートの吸収（Wav2Vec2のアライメント補正）
+        j = 0
+        while j < len(timeline_texts):
+            if timeline_texts[j] is None:
+                j += 1
+                continue
+                
+            current_id = timeline_texts[j]["id"]
+            start_idx = j
+            while j < len(timeline_texts) and timeline_texts[j] is not None and timeline_texts[j]["id"] == current_id:
+                j += 1
+            end_idx = j
+            
+            note_len = end_idx - start_idx
+            if note_len <= absorb_max_frames:
+                note_text = timeline_texts[start_idx]["text"]
+                if end_idx < len(timeline_texts) and timeline_texts[end_idx] is not None and timeline_texts[end_idx]["id"] > original_max_id:
+                    target_id = timeline_texts[end_idx]["id"]
+                    k = end_idx
+                    while k < len(timeline_texts) and timeline_texts[k] is not None and timeline_texts[k]["id"] == target_id:
+                        timeline_texts[k]["text"] = note_text
+                        k += 1
+                    timeline_texts[start_idx] = {"text": note_text, "id": target_id}
+                elif start_idx > 0 and timeline_texts[start_idx-1] is not None and timeline_texts[start_idx-1]["id"] > original_max_id:
+                    target_id = timeline_texts[start_idx-1]["id"]
+                    k = start_idx - 1
+                    while k >= 0 and timeline_texts[k] is not None and timeline_texts[k]["id"] == target_id:
+                        timeline_texts[k]["text"] = note_text
+                        k -= 1
+                    timeline_texts[start_idx] = {"text": note_text, "id": target_id}
+
     # 2. チャンク化（歌詞と丸められたピッチの両方が同じ区間を統合）
     raw_notes = []
     current_info = timeline_texts[0]
@@ -580,16 +804,34 @@ def segment_and_align_notes(char_segments, time_array, midi_contour, confidence_
             segment_pitches = midi_contour[start_frame:i]
             valid_pitches = segment_pitches[~np.isnan(segment_pitches)]
             if len(valid_pitches) > 0:
-                note_pitch = int(round(np.median(valid_pitches)))
+                rounded_pitches = np.round(valid_pitches).astype(int)
+                rounded_pitches = rounded_pitches[rounded_pitches >= 0]
+                if len(rounded_pitches) > 0:
+                    counts = np.bincount(rounded_pitches)
+                    note_pitch = int(np.argmax(counts))
+                else:
+                    note_pitch = current_midi
             else:
                 note_pitch = current_midi
+                
+            final_pitch_curve = []
+            if current_info and len(segment_pitches) > 0:
+                curve = segment_pitches.copy()
+                valid_mask = ~np.isnan(curve)
+                if np.any(valid_mask):
+                    deviations = curve[valid_mask] - note_pitch
+                    max_abs_dev = np.max(np.abs(deviations))
+                    if max_abs_dev > 7.0:
+                        scale_factor = 7.0 / max_abs_dev
+                        curve[valid_mask] = note_pitch + (deviations * scale_factor)
+                final_pitch_curve = curve.tolist()
                 
             raw_notes.append({
                 "lyric": current_info["text"] if current_info else "R",
                 "start": current_start,
                 "end": time_array[i],
                 "pitch": note_pitch if current_info else 60,
-                "pitch_curve": segment_pitches.tolist() if current_info else []
+                "pitch_curve": final_pitch_curve
             })
             current_info = this_info
             current_midi = note_pitch # 次の区間のデフォルトピッチとして更新
@@ -601,16 +843,34 @@ def segment_and_align_notes(char_segments, time_array, midi_contour, confidence_
     segment_pitches = midi_contour[start_frame:]
     valid_pitches = segment_pitches[~np.isnan(segment_pitches)]
     if len(valid_pitches) > 0:
-        note_pitch = int(round(np.median(valid_pitches)))
+        rounded_pitches = np.round(valid_pitches).astype(int)
+        rounded_pitches = rounded_pitches[rounded_pitches >= 0]
+        if len(rounded_pitches) > 0:
+            counts = np.bincount(rounded_pitches)
+            note_pitch = int(np.argmax(counts))
+        else:
+            note_pitch = current_midi
     else:
         note_pitch = current_midi
+
+    final_pitch_curve = []
+    if current_info and len(segment_pitches) > 0:
+        curve = segment_pitches.copy()
+        valid_mask = ~np.isnan(curve)
+        if np.any(valid_mask):
+            deviations = curve[valid_mask] - note_pitch
+            max_abs_dev = np.max(np.abs(deviations))
+            if max_abs_dev > 7.0:
+                scale_factor = 7.0 / max_abs_dev
+                curve[valid_mask] = note_pitch + (deviations * scale_factor)
+        final_pitch_curve = curve.tolist()
 
     raw_notes.append({
         "lyric": current_info["text"] if current_info else "R",
         "start": current_start,
         "end": time_array[-1],
         "pitch": note_pitch if current_info else 60,
-        "pitch_curve": segment_pitches.tolist() if current_info else []
+        "pitch_curve": final_pitch_curve
     })
 
     # 短いノートの統合（ノイズ除去）は撤廃し、すべてのノートをそのまま出力する
@@ -621,21 +881,9 @@ def segment_and_align_notes(char_segments, time_array, midi_contour, confidence_
     last_lyric_base = None
     
     for note in merged_raw_notes:
-        lyric = note["lyric"]
-        processed_lyric = lyric
-        
-        # 同じ文字の連続（ピッチ変動による分割）の場合、2回目以降は「ー」にする
-        if lyric != "R":
-            if lyric == last_lyric_base:
-                processed_lyric = "ー"
-            else:
-                last_lyric_base = lyric
-        else:
-            last_lyric_base = None
-            
         final_notes.append({
-            "text": processed_lyric,
-            "original_text": lyric,
+            "text": note["lyric"],
+            "original_text": note["lyric"],
             "start": note["start"],
             "end": note["end"],
             "pitch": note["pitch"],
@@ -796,7 +1044,7 @@ def export_to_ust(ust_notes, output_path, tempo=170):
                 current_tick = end_tick
                 
             f.write("[#TRACKEND]\n")
-        print(f"成功: {output_path} が生成されました（重なり強制排除済み）。")
+        print(f"成功: {output_path} が生成されました。")
     except Exception as e:
         print(f"UST書き出し中にエラーが発生しました: {e}")
 
@@ -1655,9 +1903,11 @@ def estimate_tempo(audio_path, default_tempo=120):
 def run_conversion(audio_file, output_base_path, user_specified_tempo, min_duration=0.03, export_hybrid=True, export_w2v2=False, export_whisper=False,
                    unvoiced_threshold_frames=10, frame_period=10.0, low_pitch_threshold=47, low_pitch_drop_amount=18, top_db=40, skip_b_cost=0.5, last_mora_ratio=0.7,
                    whisper_model_name="large-v3", w2v2_model_name="vumichien/wav2vec2-large-xlsr-japanese-hiragana", f0_model="PyWorld",
-                   output_formats=None):
+                   output_formats=None, pyworld_silence_threshold=-40.0, pitch_split_threshold_ms=100.0, pitch_split_fluctuation=0.2, absorb_max_ms=100.0, enable_pitch_split=False):
     if output_formats is None:
         output_formats = ["ust"]
+    pitch_split_threshold_frames = max(1, int(pitch_split_threshold_ms / frame_period))
+    absorb_max_frames = max(1, int(absorb_max_ms / frame_period))
     # Normalize paths to avoid mixed slashes on Windows
     audio_file = os.path.normpath(audio_file)
     input_dir = os.path.dirname(audio_file)
@@ -1792,31 +2042,29 @@ def run_conversion(audio_file, output_base_path, user_specified_tempo, min_durat
         chunk_lyric = "".join([seg["text"] for seg in char_segments])
         print(f"  -> WhisperX認識結果: {chunk_lyric} (文字数: {len(char_segments)})")
         
-        # 1.5. Wav2Vec2による純粋な文字起こしとタイミング検出 (デバッグ用)
-        char_segments_w2v2 = process_wav2vec2_ctc_chunk(temp_audio_file, model_w2v2, processor_w2v2, device_w2v2, offset_seconds)
-        print(f"  -> Wav2Vec2検出数: {len(char_segments_w2v2)}")
+        # 1.5. Wav2Vec2による強制アライメント (CTC Forced Alignment)
+        char_segments_merged_whisper = merge_small_chars_in_segments(char_segments)
+        char_segments_w2v2_aligned = compute_forced_alignment(temp_audio_file, char_segments_merged_whisper, model_w2v2, processor_w2v2, device_w2v2, offset_seconds)
+        
+        # 強制アライメント後、分割されてしまった小文字（ょ等）を再結合する
+        char_segments_w2v2_aligned = merge_small_chars_in_segments(char_segments_w2v2_aligned)
+        
+        print(f"  -> Wav2Vec2 強制アライメント完了 (抽出数: {len(char_segments_w2v2_aligned)})")
         
         # 2. ピッチ推移の取得
-        time_array, midi_contour, confidence_array = get_pitch_contour(temp_audio_file, frame_period=frame_period, f0_model=f0_model)
+        time_array, midi_contour, confidence_array = get_pitch_contour(temp_audio_file, frame_period=frame_period, f0_model=f0_model, pyworld_silence_threshold=pyworld_silence_threshold)
         
         # タイムアレイにオフセットを加算
         if len(time_array) > 0:
             time_array = time_array + offset_seconds
             
-            # 1.5. Wav2Vec2のアライメント結果（歌詞マッピング）を先に生成
-            
-            # WhisperX側の小書き文字を直前の文字とマージして1モーラ化する（例: "ふ" + "ぉ" -> "ふぉ"）
-            char_segments_merged = merge_small_chars_in_segments(char_segments)
-            
-            # Wav2Vec2側も同様に小書き文字をマージする（「しょ」等が2つのノートに分裂するのを防ぐため）
-            char_segments_w2v2_filtered = filter_short_w2v2_segments(char_segments_w2v2, min_duration=min_duration)
-            char_segments_w2v2_merged = merge_small_chars_in_segments(char_segments_w2v2_filtered)
-            
-            aligned_w2v2_chars = align_lyrics_to_timings(char_segments_merged, char_segments_w2v2_merged, skip_b_cost=skip_b_cost, last_mora_ratio=last_mora_ratio)
+            # 2.5 ぼかりす的アプローチ：DTWによるF0/Power境界微調整（デバッグのため一時無効化）
+            # aligned_w2v2_chars = refine_note_boundaries_with_dtw(char_segments_w2v2_aligned, time_array, confidence_array)
+            aligned_w2v2_chars = char_segments_w2v2_aligned
             
             # 3. データの結合とノート化 (ハイブリッド出力用)
             # Wav2Vec2の正確なタイミングをベースに、隙間をピッチ追従の「ー」で埋める
-            final_notes = segment_and_align_notes(aligned_w2v2_chars, time_array, midi_contour, confidence_array, min_duration=min_duration, unvoiced_threshold_frames=unvoiced_threshold_frames, low_pitch_threshold=low_pitch_threshold, low_pitch_drop_amount=low_pitch_drop_amount)
+            final_notes = segment_and_align_notes(aligned_w2v2_chars, time_array, midi_contour, confidence_array, min_duration=min_duration, unvoiced_threshold_frames=unvoiced_threshold_frames, low_pitch_threshold=low_pitch_threshold, low_pitch_drop_amount=low_pitch_drop_amount, pitch_split_threshold_frames=pitch_split_threshold_frames, pitch_split_fluctuation=pitch_split_fluctuation, absorb_max_frames=absorb_max_frames, enable_pitch_split=enable_pitch_split)
             all_final_notes.extend(final_notes)
             
             # Whisperデバッグ用: is_skipped な文字を "R" (休符) に置き換える
@@ -1827,7 +2075,7 @@ def run_conversion(audio_file, output_base_path, user_specified_tempo, min_durat
                     new_seg["text"] = "R"
                 aligned_whisper_chars.append(new_seg)
             
-            final_notes_whisper = segment_and_align_notes(aligned_whisper_chars, time_array, midi_contour, confidence_array, min_duration=min_duration, unvoiced_threshold_frames=unvoiced_threshold_frames, low_pitch_threshold=low_pitch_threshold, low_pitch_drop_amount=low_pitch_drop_amount)
+            final_notes_whisper = segment_and_align_notes(aligned_whisper_chars, time_array, midi_contour, confidence_array, min_duration=min_duration, unvoiced_threshold_frames=unvoiced_threshold_frames, low_pitch_threshold=low_pitch_threshold, low_pitch_drop_amount=low_pitch_drop_amount, pitch_split_threshold_frames=pitch_split_threshold_frames, pitch_split_fluctuation=pitch_split_fluctuation, absorb_max_frames=absorb_max_frames)
             all_final_notes_whisper.extend(final_notes_whisper)
             
             # Wav2Vec2単独出力用のノートリスト構築
@@ -1930,6 +2178,11 @@ class OToVoApp:
         self.low_pitch_threshold_var = tk.StringVar(value="47")
         self.low_pitch_drop_amount_var = tk.StringVar(value="18")
         self.top_db_var = tk.StringVar(value="40")
+        self.pyworld_silence_threshold_var = tk.StringVar(value="-40.0")
+        self.pitch_split_threshold_ms_var = tk.StringVar(value="100")
+        self.pitch_split_fluctuation_var = tk.StringVar(value="0.2")
+        self.absorb_max_ms_var = tk.StringVar(value="100")
+        self.enable_pitch_split_var = tk.BooleanVar(value=False)
         self.skip_b_cost_var = tk.StringVar(value="0.5")
         self.last_mora_ratio_var = tk.StringVar(value="0.7")
         self.whisper_model_var = tk.StringVar(value="large-v3")
@@ -2028,6 +2281,20 @@ class OToVoApp:
         
         ttk.Label(advanced_frame, text="最小ノート長(秒):").grid(row=3, column=2, sticky=tk.W, pady=2, padx=(10,0))
         ttk.Entry(advanced_frame, textvariable=self.min_duration_var, width=10).grid(row=3, column=3, sticky=tk.W, padx=5, pady=2)
+        
+        ttk.Label(advanced_frame, text="PyWorld有声閾値(dB):").grid(row=4, column=0, sticky=tk.W, pady=2)
+        ttk.Entry(advanced_frame, textvariable=self.pyworld_silence_threshold_var, width=10).grid(row=4, column=1, sticky=tk.W, padx=5, pady=2)
+        
+        ttk.Label(advanced_frame, text="ピッチ分割閾値(ms):").grid(row=4, column=2, sticky=tk.W, pady=2, padx=(10,0))
+        ttk.Entry(advanced_frame, textvariable=self.pitch_split_threshold_ms_var, width=10).grid(row=4, column=3, sticky=tk.W, padx=5, pady=2)
+        
+        ttk.Label(advanced_frame, text="ピッチ分割変動幅(半音):").grid(row=5, column=0, sticky=tk.W, pady=2)
+        ttk.Entry(advanced_frame, textvariable=self.pitch_split_fluctuation_var, width=10).grid(row=5, column=1, sticky=tk.W, padx=5, pady=2)
+        
+        ttk.Label(advanced_frame, text="吸収最大ノート長(ms):").grid(row=5, column=2, sticky=tk.W, pady=2, padx=(10,0))
+        ttk.Entry(advanced_frame, textvariable=self.absorb_max_ms_var, width=10).grid(row=5, column=3, sticky=tk.W, padx=5, pady=2)
+        
+        ttk.Checkbutton(advanced_frame, text="ピッチ推移による自動ノート分割・結合を有効にする", variable=self.enable_pitch_split_var).grid(row=6, column=0, columnspan=4, sticky=tk.W, pady=2)
         
         # Export Source checkboxes frame
         export_frame = ttk.LabelFrame(frame, text="出力する認識データ (入力ソース)", padding="5")
@@ -2159,6 +2426,11 @@ class OToVoApp:
             top_db = float(self.top_db_var.get().strip())
             skip_b_cost = float(self.skip_b_cost_var.get().strip())
             last_mora_ratio = float(self.last_mora_ratio_var.get().strip())
+            pyworld_silence_threshold = float(self.pyworld_silence_threshold_var.get().strip())
+            pitch_split_threshold_ms = float(self.pitch_split_threshold_ms_var.get().strip())
+            pitch_split_fluctuation = float(self.pitch_split_fluctuation_var.get().strip())
+            absorb_max_ms = float(self.absorb_max_ms_var.get().strip())
+            enable_pitch_split = self.enable_pitch_split_var.get()
         except ValueError:
             messagebox.showerror("エラー", "詳細設定の各項目には正しい数値を入力してください。")
             return
@@ -2215,18 +2487,18 @@ class OToVoApp:
         # 別スレッドで処理を実行（GUIのフリーズ防止）
         threading.Thread(target=self.run_conversion_thread, args=(audio_file, output_base, user_tempo, min_duration, export_hybrid, export_w2v2, export_whisper,
                                                                    unvoiced_threshold_frames, frame_period, low_pitch_threshold, low_pitch_drop_amount, top_db, skip_b_cost, last_mora_ratio,
-                                                                   whisper_model_name, w2v2_model_name, f0_model, output_formats), daemon=True).start()
+                                                                   whisper_model_name, w2v2_model_name, f0_model, output_formats, pyworld_silence_threshold, pitch_split_threshold_ms, pitch_split_fluctuation, absorb_max_ms, enable_pitch_split), daemon=True).start()
 
     def run_conversion_thread(self, audio_file, output_base, user_tempo, min_duration, export_hybrid, export_w2v2, export_whisper,
                               unvoiced_threshold_frames, frame_period, low_pitch_threshold, low_pitch_drop_amount, top_db, skip_b_cost, last_mora_ratio,
-                              whisper_model_name, w2v2_model_name, f0_model, output_formats):
+                              whisper_model_name, w2v2_model_name, f0_model, output_formats, pyworld_silence_threshold, pitch_split_threshold_ms, pitch_split_fluctuation, absorb_max_ms, enable_pitch_split):
         try:
             run_conversion(audio_file, output_base, user_tempo, min_duration, export_hybrid, export_w2v2, export_whisper,
                            unvoiced_threshold_frames=unvoiced_threshold_frames, frame_period=frame_period,
                            low_pitch_threshold=low_pitch_threshold, low_pitch_drop_amount=low_pitch_drop_amount,
                            top_db=top_db, skip_b_cost=skip_b_cost, last_mora_ratio=last_mora_ratio,
                            whisper_model_name=whisper_model_name, w2v2_model_name=w2v2_model_name, f0_model=f0_model,
-                           output_formats=output_formats)
+                           output_formats=output_formats, pyworld_silence_threshold=pyworld_silence_threshold, pitch_split_threshold_ms=pitch_split_threshold_ms, pitch_split_fluctuation=pitch_split_fluctuation, absorb_max_ms=absorb_max_ms, enable_pitch_split=enable_pitch_split)
         except Exception as e:
             import traceback
             print(f"\nエラーが発生しました:\n{traceback.format_exc()}")
