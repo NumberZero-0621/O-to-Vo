@@ -29,16 +29,125 @@ import pyopenjtalk
 import jaconv
 import whisperx
 from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
+import g2p_en
 
 # PyannoteのReproducibilityWarning (TF32関連) を抑制
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+
+# --- 英語からボカロ風ひらがなへの変換 ---
+g2p_instance = None
+
+VOWEL_GROUPS = {
+    'AA': ('A', ''), 'AE': ('A', ''), 'AH': ('A', ''),
+    'AO': ('O', ''), 'AW': ('A', 'う'), 'AY': ('A', 'い'),
+    'EH': ('E', ''), 'ER': ('A', 'ー'), 'EY': ('E', 'い'),
+    'IH': ('I', ''), 'IY': ('I', 'ー'),
+    'OW': ('O', 'ー'), 'OY': ('O', 'い'),
+    'UH': ('U', ''), 'UW': ('U', 'ー')
+}
+
+ARPABET_CONSONANTS_ALONE = {
+    'B': 'ぶ', 'CH': 'ち', 'D': 'ど', 'DH': 'ず', 'F': 'ふ', 'G': 'ぐ',
+    'HH': 'は', 'JH': 'じ', 'K': 'く', 'L': 'る', 'M': 'む', 'N': 'ん',
+    'NG': 'ん', 'P': 'ぷ', 'R': 'あー', 'S': 'す', 'SH': 'し', 'T': 'と',
+    'TH': 'す', 'V': 'ぶ', 'W': 'う', 'Y': 'い', 'Z': 'ず', 'ZH': 'じ'
+}
+
+CV_MAP = {
+    'B': {'A': 'ば', 'I': 'び', 'U': 'ぶ', 'E': 'べ', 'O': 'ぼ'},
+    'CH': {'A': 'ちゃ', 'I': 'ち', 'U': 'ちゅ', 'E': 'ちぇ', 'O': 'ちょ'},
+    'D': {'A': 'だ', 'I': 'でぃ', 'U': 'どぅ', 'E': 'で', 'O': 'ど'},
+    'DH': {'A': 'ざ', 'I': 'じ', 'U': 'ず', 'E': 'ぜ', 'O': 'ぞ'},
+    'F': {'A': 'ふぁ', 'I': 'ふぃ', 'U': 'ふ', 'E': 'ふぇ', 'O': 'ふぉ'},
+    'G': {'A': 'が', 'I': 'ぎ', 'U': 'ぐ', 'E': 'げ', 'O': 'ご'},
+    'HH': {'A': 'は', 'I': 'ひ', 'U': 'ふ', 'E': 'へ', 'O': 'ほ'},
+    'JH': {'A': 'じゃ', 'I': 'じ', 'U': 'じゅ', 'E': 'じぇ', 'O': 'じょ'},
+    'K': {'A': 'か', 'I': 'き', 'U': 'く', 'E': 'け', 'O': 'こ'},
+    'L': {'A': 'ら', 'I': 'り', 'U': 'る', 'E': 'れ', 'O': 'ろ'},
+    'M': {'A': 'ま', 'I': 'み', 'U': 'む', 'E': 'め', 'O': 'も'},
+    'N': {'A': 'な', 'I': 'に', 'U': 'ぬ', 'E': 'ね', 'O': 'の'},
+    'NG': {'A': 'が', 'I': 'ぎ', 'U': 'ぐ', 'E': 'げ', 'O': 'ご'}, 
+    'P': {'A': 'ぱ', 'I': 'ぴ', 'U': 'ぷ', 'E': 'ぺ', 'O': 'ぽ'},
+    'R': {'A': 'ら', 'I': 'り', 'U': 'る', 'E': 'れ', 'O': 'ろ'},
+    'S': {'A': 'さ', 'I': 'し', 'U': 'す', 'E': 'せ', 'O': 'そ'},
+    'SH': {'A': 'しゃ', 'I': 'し', 'U': 'しゅ', 'E': 'しぇ', 'O': 'しょ'},
+    'T': {'A': 'た', 'I': 'てぃ', 'U': 'とぅ', 'E': 'て', 'O': 'と'},
+    'TH': {'A': 'さ', 'I': 'し', 'U': 'す', 'E': 'せ', 'O': 'そ'},
+    'V': {'A': 'ば', 'I': 'び', 'U': 'ぶ', 'E': 'べ', 'O': 'ぼ'},
+    'W': {'A': 'わ', 'I': 'うぃ', 'U': 'う', 'E': 'うぇ', 'O': 'を'},
+    'Y': {'A': 'や', 'I': 'い', 'U': 'ゆ', 'E': 'いぇ', 'O': 'よ'},
+    'Z': {'A': 'ざ', 'I': 'じ', 'U': 'ず', 'E': 'ぜ', 'O': 'ぞ'},
+    'ZH': {'A': 'じゃ', 'I': 'じ', 'U': 'じゅ', 'E': 'じぇ', 'O': 'じょ'},
+}
+
+def convert_english_segment(text):
+    global g2p_instance
+    if g2p_instance is None:
+        g2p_instance = g2p_en.G2p()
+        
+    phonemes = g2p_instance(text)
+    cleaned_phonemes = []
+    for p in phonemes:
+        p_base = ''.join([c for c in p if c.isalpha()])
+        if p_base in VOWEL_GROUPS or p_base in ARPABET_CONSONANTS_ALONE:
+            cleaned_phonemes.append(p_base)
+            
+    result = ""
+    i = 0
+    while i < len(cleaned_phonemes):
+        p1 = cleaned_phonemes[i]
+        
+        # Sokuon check (consecutive identical consonants, except N)
+        if i + 1 < len(cleaned_phonemes):
+            p2 = cleaned_phonemes[i+1]
+            if p1 == p2 and p1 in ARPABET_CONSONANTS_ALONE and p1 != 'N':
+                result += "っ"
+                i += 1
+                continue
+                
+        # Is it a vowel?
+        if p1 in VOWEL_GROUPS:
+            v_type, suffix = VOWEL_GROUPS[p1]
+            v_map = {'A': 'あ', 'I': 'い', 'U': 'う', 'E': 'え', 'O': 'お'}
+            result += v_map[v_type] + suffix
+            i += 1
+            continue
+            
+        # It's a consonant
+        if i + 1 < len(cleaned_phonemes):
+            p2 = cleaned_phonemes[i+1]
+            if p2 in VOWEL_GROUPS:
+                # CV combination
+                v_type, suffix = VOWEL_GROUPS[p2]
+                if p1 in CV_MAP and v_type in CV_MAP[p1]:
+                    result += CV_MAP[p1][v_type] + suffix
+                else:
+                    result += ARPABET_CONSONANTS_ALONE.get(p1, '') + VOWEL_GROUPS[p2][0] + suffix
+                i += 2
+                continue
+                
+        # Consonant alone
+        result += ARPABET_CONSONANTS_ALONE.get(p1, '')
+        i += 1
+        
+    return result
+
+def convert_english_to_vocaloid_hiragana(text):
+    if not text:
+        return text
+    pattern = r'[A-Za-z0-9\']+(?:[ \t\.,\!\?]+[A-Za-z0-9\']+)*'
+    def replacer(m):
+        return convert_english_segment(m.group(0))
+    return re.sub(pattern, replacer, text)
 
 # 漢字・カタカナ等をひらがなのモーラに分割する関数
 def get_word_moras(text):
     """pyopenjtalkとjaconvを用いてテキストをひらがなのモーラ（文字）リストに変換する"""
     if not text or text.strip() == "":
         return []
+        
+    text = convert_english_to_vocaloid_hiragana(text)
     
     try:
         features = pyopenjtalk.run_frontend(text)
@@ -62,8 +171,41 @@ def get_word_moras(text):
     except Exception as e:
         print(f"pyopenjtalk変換エラー: {e}")
         # フォールバックとして元の文字列を文字ごとに分割して返す
-        exclude_chars = "’、っ。！?？（）() 　.,'\"-"
+        exclude_chars = "’、っ。！?？（）() 　.,'\"-\n\r\t "
         return [c for c in text if c not in exclude_chars]
+
+def get_vocaloid_preview_text(text):
+    """プレビュー用にスペースや改行などのレイアウトを保持しつつ、ふりがなに変換する"""
+    if not text:
+        return text
+    text = convert_english_to_vocaloid_hiragana(text)
+    
+    try:
+        features = pyopenjtalk.run_frontend(text)
+    except Exception:
+        return text
+        
+    preview = ""
+    orig_ptr = 0
+    
+    for f in features:
+        node_str = f.get('string', '')
+        if not node_str or node_str.strip('　 \t\n\r') == '':
+            continue
+            
+        start_idx = text.find(node_str, orig_ptr)
+        if start_idx != -1:
+            preview += text[orig_ptr:start_idx]
+            pron = f.get('pron', '')
+            if not pron or pron == '*':
+                pron = node_str
+            hira_pron = jaconv.kata2hira(pron)
+            hira_pron = hira_pron.replace('’', '').replace("'", "")
+            preview += hira_pron
+            orig_ptr = start_idx + len(node_str)
+            
+    preview += text[orig_ptr:]
+    return preview
 
 # 日本語文字から母音を判定するためのマッピング
 def get_vowel(text):
@@ -1900,10 +2042,38 @@ def estimate_tempo(audio_path, default_tempo=120):
 # ==========================================
 # メイン処理（実行フロー）
 # ==========================================
+def consume_lyrics(whisper_text, remaining_lyrics):
+    if not whisper_text:
+        return "", remaining_lyrics
+    if not remaining_lyrics:
+        return "", ""
+        
+    N = len(whisper_text)
+    M = min(len(remaining_lyrics), N * 2 + 10)
+    
+    dp = np.full((N + 1, M + 1), float('inf'))
+    dp[0, 0] = 0
+    for j in range(1, M + 1):
+        dp[0, j] = j * 0.1
+        
+    for i in range(1, N + 1):
+        dp[i, 0] = i
+        for j in range(1, M + 1):
+            cost = 0 if whisper_text[i-1] == remaining_lyrics[j-1] else 1
+            dp[i, j] = min(dp[i-1, j-1] + cost, dp[i-1, j] + 1, dp[i, j-1] + 1)
+            
+    best_j = np.argmin(dp[N, :])
+    if best_j == 0:
+        best_j = min(N, len(remaining_lyrics))
+        
+    consumed = remaining_lyrics[:best_j]
+    return consumed, remaining_lyrics[best_j:]
+
 def run_conversion(audio_file, output_base_path, user_specified_tempo, min_duration=0.03, export_hybrid=True, export_w2v2=False, export_whisper=False,
                    unvoiced_threshold_frames=10, frame_period=10.0, low_pitch_threshold=47, low_pitch_drop_amount=18, top_db=40, skip_b_cost=0.5, last_mora_ratio=0.7,
                    whisper_model_name="large-v3", w2v2_model_name="vumichien/wav2vec2-large-xlsr-japanese-hiragana", f0_model="PyWorld",
-                   output_formats=None, pyworld_silence_threshold=-40.0, pitch_split_threshold_ms=100.0, pitch_split_fluctuation=0.2, absorb_max_ms=100.0, enable_pitch_split=False):
+                   output_formats=None, pyworld_silence_threshold=-40.0, pitch_split_threshold_ms=100.0, pitch_split_fluctuation=0.2, absorb_max_ms=100.0, enable_pitch_split=False,
+                   predefined_lyrics=None, convert_to_vocaloid=False):
     if output_formats is None:
         output_formats = ["ust"]
     pitch_split_threshold_frames = max(1, int(pitch_split_threshold_ms / frame_period))
@@ -2021,6 +2191,17 @@ def run_conversion(audio_file, output_base_path, user_specified_tempo, min_durat
     all_final_notes_whisper = [] # Whisperデバッグ出力用
     print(f"全 {len(final_chunks)} チャンクに分割しました。処理を開始します...")
     
+    remaining_lyrics = None
+    if predefined_lyrics is not None:
+        if convert_to_vocaloid:
+            # ボカロ語に変換（pyopenjtalkでひらがな化＋は->わ等）
+            lyrics_chars = get_word_moras(predefined_lyrics)
+            remaining_lyrics = "".join(lyrics_chars)
+        else:
+            # 律儀にそのまま（ただし不要な記号や空白は除去）
+            exclude_chars = "’、っ。！?？（）() 　.,'\"-\n\r\t "
+            remaining_lyrics = "".join([c for c in predefined_lyrics if c not in exclude_chars])
+            
     for i, (start_sample, end_sample) in enumerate(final_chunks):
         chunk_audio = full_audio[start_sample:end_sample]
         offset_seconds = start_sample / sr
@@ -2038,9 +2219,23 @@ def run_conversion(audio_file, output_base_path, user_specified_tempo, min_durat
         # 1. 音声認識とアライメント (WhisperXハイブリッド)
         char_segments = process_whisperx_chunk(temp_audio_file, model, model_a, metadata, device, offset_seconds)
         
+        if remaining_lyrics is not None:
+            whisper_text = "".join([seg["text"] for seg in char_segments])
+            consumed_text, remaining_lyrics = consume_lyrics(whisper_text, remaining_lyrics)
+            if char_segments and consumed_text:
+                chunk_start = char_segments[0]["start"]
+                chunk_end = char_segments[-1]["end"]
+                dur = (chunk_end - chunk_start) / len(consumed_text)
+                new_char_segments = []
+                for idx, c in enumerate(consumed_text):
+                    new_char_segments.append({"text": c, "start": chunk_start + idx*dur, "end": chunk_start + (idx+1)*dur})
+                char_segments = new_char_segments
+            else:
+                char_segments = []
+                
         # 認識されたひらがなをコンソールに表示
         chunk_lyric = "".join([seg["text"] for seg in char_segments])
-        print(f"  -> WhisperX認識結果: {chunk_lyric} (文字数: {len(char_segments)})")
+        print(f"  -> 認識・アサイン結果: {chunk_lyric} (文字数: {len(char_segments)})")
         
         # 1.5. Wav2Vec2による強制アライメント (CTC Forced Alignment)
         char_segments_merged_whisper = merge_small_chars_in_segments(char_segments)
@@ -2200,6 +2395,9 @@ class OToVoApp:
         self.fmt_tssln_var = tk.BooleanVar(value=False)
         self.fmt_midi_var = tk.BooleanVar(value=True)
         
+        self.use_predefined_lyrics_var = tk.BooleanVar(value=False)
+        self.convert_to_vocaloid_var = tk.BooleanVar(value=False)
+        
         self.create_widgets()
         
         # 標準出力と標準エラー出力をテキストボックスにリダイレクト
@@ -2207,8 +2405,48 @@ class OToVoApp:
         sys.stderr = ThreadSafeTextRedirector(self.log_text)
 
     def create_widgets(self):
-        frame = ttk.Frame(self.root, padding="10")
-        frame.pack(fill=tk.BOTH, expand=True)
+        # 1. Main Vertical PanedWindow
+        main_paned = ttk.PanedWindow(self.root, orient=tk.VERTICAL)
+        main_paned.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        # Top pane (Settings + Lyrics)
+        top_pane = ttk.Frame(main_paned)
+        main_paned.add(top_pane, weight=3)
+        
+        # Bottom pane (Logs)
+        log_pane = ttk.Frame(main_paned)
+        main_paned.add(log_pane, weight=1)
+        
+        # 2. Scrollable Canvas for top_pane
+        self.main_canvas = tk.Canvas(top_pane, highlightthickness=0)
+        self.main_scrollbar = ttk.Scrollbar(top_pane, orient="vertical", command=self.main_canvas.yview)
+        
+        self.scrollable_frame = ttk.Frame(self.main_canvas, padding="5")
+        
+        self.scrollable_frame.bind(
+            "<Configure>",
+            lambda e: self.main_canvas.configure(
+                scrollregion=self.main_canvas.bbox("all")
+            )
+        )
+        
+        self.canvas_window = self.main_canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
+        
+        def on_canvas_configure(event):
+            self.main_canvas.itemconfig(self.canvas_window, width=event.width)
+            
+        self.main_canvas.bind("<Configure>", on_canvas_configure)
+        self.main_canvas.configure(yscrollcommand=self.main_scrollbar.set)
+        
+        self.main_scrollbar.pack(side="right", fill="y")
+        self.main_canvas.pack(side="left", fill="both", expand=True)
+        
+        def _on_mousewheel(event):
+            if self.main_canvas.winfo_exists() and self.main_canvas.bbox("all")[3] > self.main_canvas.winfo_height():
+                self.main_canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+        self.root.bind_all("<MouseWheel>", _on_mousewheel)
+        
+        frame = self.scrollable_frame
         
         # File selection
         file_frame = ttk.Frame(frame)
@@ -2253,6 +2491,63 @@ class OToVoApp:
         
         ttk.Label(options_frame, text="BPM (空欄で自動推定):").grid(row=0, column=0, sticky=tk.W, pady=2)
         ttk.Entry(options_frame, textvariable=self.tempo_var, width=10).grid(row=0, column=1, sticky=tk.W, padx=5, pady=2)
+        
+        # 事前入力歌詞
+        lyrics_frame = ttk.LabelFrame(frame, text="歌詞", padding="5")
+        lyrics_frame.pack(fill=tk.X, pady=5)
+        
+        lyrics_options_frame = ttk.Frame(lyrics_frame)
+        lyrics_options_frame.pack(fill=tk.X)
+        
+        ttk.Checkbutton(lyrics_options_frame, text="歌詞を事前に入力する", variable=self.use_predefined_lyrics_var, command=self.on_use_predefined_lyrics_toggle).pack(side=tk.LEFT)
+        ttk.Checkbutton(lyrics_options_frame, text="ボカロ語に変換", variable=self.convert_to_vocaloid_var).pack(side=tk.LEFT, padx=10)
+        
+        text_container = ttk.PanedWindow(lyrics_frame, orient=tk.HORIZONTAL)
+        text_container.pack(fill=tk.BOTH, expand=True, pady=5)
+        
+        left_pane = ttk.Frame(text_container)
+        right_pane = ttk.Frame(text_container)
+        
+        text_container.add(left_pane, weight=1)
+        text_container.add(right_pane, weight=1)
+        
+        ttk.Label(left_pane, text="元の歌詞").pack(anchor=tk.W)
+        self.predefined_lyrics_text = scrolledtext.ScrolledText(left_pane, height=6, state='disabled', undo=True, maxundo=-1, bg='#e0e0e0')
+        self.predefined_lyrics_text.pack(fill=tk.BOTH, expand=True, padx=(0, 2))
+        
+        ttk.Label(right_pane, text="変換プレビュー (編集不可)").pack(anchor=tk.W)
+        self.vocaloid_lyrics_text = scrolledtext.ScrolledText(right_pane, height=6, state='disabled', bg='#f0f0f0')
+        self.vocaloid_lyrics_text.pack(fill=tk.BOTH, expand=True, padx=(2, 0))
+        
+        def sync_predefined(*args):
+            self.predefined_lyrics_text.vbar.set(*args)
+            self.vocaloid_lyrics_text.yview_moveto(args[0])
+            
+        def sync_vocaloid(*args):
+            self.vocaloid_lyrics_text.vbar.set(*args)
+            self.predefined_lyrics_text.yview_moveto(args[0])
+            
+        self.predefined_lyrics_text['yscrollcommand'] = sync_predefined
+        self.vocaloid_lyrics_text['yscrollcommand'] = sync_vocaloid
+        
+        def on_undo(event):
+            try: self.predefined_lyrics_text.edit_undo()
+            except tk.TclError: pass
+            self.update_vocaloid_preview_delayed()
+            return "break"
+            
+        def on_redo(event):
+            try: self.predefined_lyrics_text.edit_redo()
+            except tk.TclError: pass
+            self.update_vocaloid_preview_delayed()
+            return "break"
+            
+        self.predefined_lyrics_text.bind("<Control-z>", on_undo)
+        self.predefined_lyrics_text.bind("<Control-y>", on_redo)
+        self.predefined_lyrics_text.bind("<Control-Shift-Z>", on_redo)
+        self.predefined_lyrics_text.bind("<Control-Shift-z>", on_redo)
+        self.predefined_lyrics_text.bind("<KeyRelease>", self.update_vocaloid_preview_delayed)
+        self.convert_to_vocaloid_var.trace_add("write", self.update_vocaloid_preview_delayed)
         
         # --- 追加パラメータ（詳細設定予定） ---
         advanced_frame = ttk.LabelFrame(frame, text="詳細設定", padding="5")
@@ -2320,9 +2615,40 @@ class OToVoApp:
         self.start_btn.pack(pady=10)
         
         # Log Text
-        ttk.Label(frame, text="ログ出力:").pack(anchor=tk.W)
-        self.log_text = scrolledtext.ScrolledText(frame, height=15, state='disabled')
-        self.log_text.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(log_pane, text="ログ出力:").pack(anchor=tk.W, padx=5, pady=(5, 0))
+        self.log_text = scrolledtext.ScrolledText(log_pane, height=1, state='disabled')
+        self.log_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+    def on_use_predefined_lyrics_toggle(self):
+        if self.use_predefined_lyrics_var.get():
+            self.predefined_lyrics_text.config(state='normal', bg='white')
+        else:
+            self.predefined_lyrics_text.config(state='disabled', bg='#e0e0e0')
+        self.update_vocaloid_preview_delayed()
+            
+    def update_vocaloid_preview_delayed(self, *args):
+        if hasattr(self, '_preview_after_id') and self._preview_after_id:
+            self.root.after_cancel(self._preview_after_id)
+        self._preview_after_id = self.root.after(100, self.update_vocaloid_preview)
+        
+    def update_vocaloid_preview(self, *args):
+        self.vocaloid_lyrics_text.config(state='normal')
+        self.vocaloid_lyrics_text.delete("1.0", tk.END)
+        
+        if not self.use_predefined_lyrics_var.get():
+            self.vocaloid_lyrics_text.config(state='disabled')
+            return
+            
+        text = self.predefined_lyrics_text.get("1.0", tk.END).strip()
+        
+        if self.convert_to_vocaloid_var.get() and text:
+            preview_text = get_vocaloid_preview_text(text)
+            self.vocaloid_lyrics_text.insert(tk.END, preview_text)
+        elif text:
+            # 変換しない場合もスペース・改行を維持してそのまま表示する
+            self.vocaloid_lyrics_text.insert(tk.END, text)
+            
+        self.vocaloid_lyrics_text.config(state='disabled')
 
     def on_model_select(self, event):
         cb = event.widget
@@ -2418,6 +2744,14 @@ class OToVoApp:
                 messagebox.showerror("エラー", "最小ノート長は数値を入力してください。")
                 return
 
+        use_predefined = self.use_predefined_lyrics_var.get()
+        convert_to_vocaloid = self.convert_to_vocaloid_var.get()
+        predefined_lyrics = self.predefined_lyrics_text.get("1.0", tk.END).strip() if use_predefined else None
+        
+        if use_predefined and not predefined_lyrics:
+            messagebox.showerror("エラー", "事前に入力する歌詞が空です。")
+            return
+
         try:
             unvoiced_threshold_frames = int(self.unvoiced_threshold_var.get().strip())
             frame_period = float(self.frame_period_var.get().strip())
@@ -2487,11 +2821,11 @@ class OToVoApp:
         # 別スレッドで処理を実行（GUIのフリーズ防止）
         threading.Thread(target=self.run_conversion_thread, args=(audio_file, output_base, user_tempo, min_duration, export_hybrid, export_w2v2, export_whisper,
                                                                    unvoiced_threshold_frames, frame_period, low_pitch_threshold, low_pitch_drop_amount, top_db, skip_b_cost, last_mora_ratio,
-                                                                   whisper_model_name, w2v2_model_name, f0_model, output_formats, pyworld_silence_threshold, pitch_split_threshold_ms, pitch_split_fluctuation, absorb_max_ms, enable_pitch_split), daemon=True).start()
+                                                                   whisper_model_name, w2v2_model_name, f0_model, output_formats, pyworld_silence_threshold, pitch_split_threshold_ms, pitch_split_fluctuation, absorb_max_ms, enable_pitch_split, predefined_lyrics, convert_to_vocaloid), daemon=True).start()
 
     def run_conversion_thread(self, audio_file, output_base, user_tempo, min_duration, export_hybrid, export_w2v2, export_whisper,
                               unvoiced_threshold_frames, frame_period, low_pitch_threshold, low_pitch_drop_amount, top_db, skip_b_cost, last_mora_ratio,
-                              whisper_model_name, w2v2_model_name, f0_model, output_formats, pyworld_silence_threshold, pitch_split_threshold_ms, pitch_split_fluctuation, absorb_max_ms, enable_pitch_split):
+                              whisper_model_name, w2v2_model_name, f0_model, output_formats, pyworld_silence_threshold, pitch_split_threshold_ms, pitch_split_fluctuation, absorb_max_ms, enable_pitch_split, predefined_lyrics, convert_to_vocaloid):
         try:
             run_conversion(audio_file, output_base, user_tempo, min_duration, export_hybrid, export_w2v2, export_whisper,
                            unvoiced_threshold_frames=unvoiced_threshold_frames, frame_period=frame_period,
