@@ -2073,7 +2073,7 @@ def run_conversion(audio_file, output_base_path, user_specified_tempo, min_durat
                    unvoiced_threshold_frames=10, frame_period=10.0, low_pitch_threshold=47, low_pitch_drop_amount=18, top_db=40, skip_b_cost=0.5, last_mora_ratio=0.7,
                    whisper_model_name="large-v3", w2v2_model_name="vumichien/wav2vec2-large-xlsr-japanese-hiragana", f0_model="PyWorld",
                    output_formats=None, pyworld_silence_threshold=-40.0, pitch_split_threshold_ms=100.0, pitch_split_fluctuation=0.2, absorb_max_ms=100.0, enable_pitch_split=False,
-                   predefined_lyrics=None, convert_to_vocaloid=False):
+                   predefined_lyrics=None, convert_to_vocaloid=False, extract_vocals=False):
     if output_formats is None:
         output_formats = ["ust"]
     pitch_split_threshold_frames = max(1, int(pitch_split_threshold_ms / frame_period))
@@ -2147,6 +2147,26 @@ def run_conversion(audio_file, output_base_path, user_specified_tempo, min_durat
     # モデルの事前ロード
     model, model_a, metadata, device = load_whisperx_models(whisper_model_name, w2v2_model_name)
     model_w2v2, processor_w2v2, device_w2v2 = load_wav2vec2_ctc_model(w2v2_model_name)
+    
+    print(f"変換処理を開始します: {process_audio_file}")
+    
+    if extract_vocals:
+        print("Demucsを用いたボーカル抽出を開始します...")
+        try:
+            import subprocess
+            demucs_out_dir = os.path.join(os.path.dirname(output_base_path), "demucs_out")
+            cmd = [sys.executable, "-m", "demucs.separate", "-n", "htdemucs", "--two-stems=vocals", process_audio_file, "-o", demucs_out_dir]
+            subprocess.run(cmd, check=True)
+            
+            input_basename = os.path.splitext(os.path.basename(process_audio_file))[0]
+            vocals_path = os.path.join(demucs_out_dir, "htdemucs", input_basename, "vocals.wav")
+            if os.path.exists(vocals_path):
+                process_audio_file = vocals_path
+                print(f"ボーカル抽出完了: {process_audio_file}")
+            else:
+                print("抽出されたボーカルファイルが見つかりません。元の音声で続行します。")
+        except Exception as e:
+            print(f"ボーカル抽出に失敗しました: {e}。元の音声で続行します。")
     
     sr, full_audio = wavfile.read(process_audio_file)
     # モノラル化
@@ -2395,6 +2415,8 @@ class OToVoApp:
         self.fmt_tssln_var = tk.BooleanVar(value=False)
         self.fmt_midi_var = tk.BooleanVar(value=True)
         
+        self.extract_vocals_var = tk.BooleanVar(value=False)
+        
         self.use_predefined_lyrics_var = tk.BooleanVar(value=False)
         self.convert_to_vocaloid_var = tk.BooleanVar(value=False)
         
@@ -2488,6 +2510,8 @@ class OToVoApp:
         # Options frame
         options_frame = ttk.Frame(frame)
         options_frame.pack(fill=tk.X, pady=5)
+        
+        ttk.Checkbutton(options_frame, text="変換前にボーカル抽出を行う (Demucs)", variable=self.extract_vocals_var).grid(row=0, column=2, sticky=tk.W, padx=10, pady=2)
         
         ttk.Label(options_frame, text="BPM (空欄で自動推定):").grid(row=0, column=0, sticky=tk.W, pady=2)
         ttk.Entry(options_frame, textvariable=self.tempo_var, width=10).grid(row=0, column=1, sticky=tk.W, padx=5, pady=2)
@@ -2769,6 +2793,8 @@ class OToVoApp:
             messagebox.showerror("エラー", "詳細設定の各項目には正しい数値を入力してください。")
             return
             
+        extract_vocals = self.extract_vocals_var.get()
+            
         whisper_model_name = self.whisper_model_var.get().strip()
         w2v2_model_name = self.w2v2_model_var.get().strip()
         f0_model = self.f0_model_var.get().strip()
@@ -2821,18 +2847,18 @@ class OToVoApp:
         # 別スレッドで処理を実行（GUIのフリーズ防止）
         threading.Thread(target=self.run_conversion_thread, args=(audio_file, output_base, user_tempo, min_duration, export_hybrid, export_w2v2, export_whisper,
                                                                    unvoiced_threshold_frames, frame_period, low_pitch_threshold, low_pitch_drop_amount, top_db, skip_b_cost, last_mora_ratio,
-                                                                   whisper_model_name, w2v2_model_name, f0_model, output_formats, pyworld_silence_threshold, pitch_split_threshold_ms, pitch_split_fluctuation, absorb_max_ms, enable_pitch_split, predefined_lyrics, convert_to_vocaloid), daemon=True).start()
+                                                                   whisper_model_name, w2v2_model_name, f0_model, output_formats, pyworld_silence_threshold, pitch_split_threshold_ms, pitch_split_fluctuation, absorb_max_ms, enable_pitch_split, predefined_lyrics, convert_to_vocaloid, extract_vocals), daemon=True).start()
 
     def run_conversion_thread(self, audio_file, output_base, user_tempo, min_duration, export_hybrid, export_w2v2, export_whisper,
                               unvoiced_threshold_frames, frame_period, low_pitch_threshold, low_pitch_drop_amount, top_db, skip_b_cost, last_mora_ratio,
-                              whisper_model_name, w2v2_model_name, f0_model, output_formats, pyworld_silence_threshold, pitch_split_threshold_ms, pitch_split_fluctuation, absorb_max_ms, enable_pitch_split, predefined_lyrics, convert_to_vocaloid):
+                              whisper_model_name, w2v2_model_name, f0_model, output_formats, pyworld_silence_threshold, pitch_split_threshold_ms, pitch_split_fluctuation, absorb_max_ms, enable_pitch_split, predefined_lyrics, convert_to_vocaloid, extract_vocals):
         try:
             run_conversion(audio_file, output_base, user_tempo, min_duration, export_hybrid, export_w2v2, export_whisper,
                            unvoiced_threshold_frames=unvoiced_threshold_frames, frame_period=frame_period,
                            low_pitch_threshold=low_pitch_threshold, low_pitch_drop_amount=low_pitch_drop_amount,
                            top_db=top_db, skip_b_cost=skip_b_cost, last_mora_ratio=last_mora_ratio,
                            whisper_model_name=whisper_model_name, w2v2_model_name=w2v2_model_name, f0_model=f0_model,
-                           output_formats=output_formats, pyworld_silence_threshold=pyworld_silence_threshold, pitch_split_threshold_ms=pitch_split_threshold_ms, pitch_split_fluctuation=pitch_split_fluctuation, absorb_max_ms=absorb_max_ms, enable_pitch_split=enable_pitch_split)
+                           output_formats=output_formats, pyworld_silence_threshold=pyworld_silence_threshold, pitch_split_threshold_ms=pitch_split_threshold_ms, pitch_split_fluctuation=pitch_split_fluctuation, absorb_max_ms=absorb_max_ms, enable_pitch_split=enable_pitch_split, predefined_lyrics=predefined_lyrics, convert_to_vocaloid=convert_to_vocaloid, extract_vocals=extract_vocals)
         except Exception as e:
             import traceback
             print(f"\nエラーが発生しました:\n{traceback.format_exc()}")
