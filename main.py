@@ -2543,13 +2543,17 @@ class OToVoApp:
         self.vocaloid_lyrics_text = scrolledtext.ScrolledText(right_pane, height=6, state='disabled', bg='#f0f0f0')
         self.vocaloid_lyrics_text.pack(fill=tk.BOTH, expand=True, padx=(2, 0))
         
+        self._is_updating_preview = False
+        
         def sync_predefined(*args):
             self.predefined_lyrics_text.vbar.set(*args)
-            self.vocaloid_lyrics_text.yview_moveto(args[0])
+            if not getattr(self, '_is_updating_preview', False):
+                self.vocaloid_lyrics_text.yview_moveto(args[0])
             
         def sync_vocaloid(*args):
             self.vocaloid_lyrics_text.vbar.set(*args)
-            self.predefined_lyrics_text.yview_moveto(args[0])
+            if not getattr(self, '_is_updating_preview', False):
+                self.predefined_lyrics_text.yview_moveto(args[0])
             
         self.predefined_lyrics_text['yscrollcommand'] = sync_predefined
         self.vocaloid_lyrics_text['yscrollcommand'] = sync_vocaloid
@@ -2572,6 +2576,42 @@ class OToVoApp:
         self.predefined_lyrics_text.bind("<Control-Shift-z>", on_redo)
         self.predefined_lyrics_text.bind("<KeyRelease>", self.update_vocaloid_preview_delayed)
         self.convert_to_vocaloid_var.trace_add("write", self.update_vocaloid_preview_delayed)
+        
+        # --- 検索・置換UI ---
+        search_replace_frame = ttk.Frame(lyrics_frame)
+        search_replace_frame.pack(fill=tk.X, pady=(5, 0))
+        
+        ttk.Label(search_replace_frame, text="検索:").pack(side=tk.LEFT)
+        self.search_var = tk.StringVar()
+        self.search_entry = ttk.Entry(search_replace_frame, textvariable=self.search_var, width=15)
+        self.search_entry.pack(side=tk.LEFT, padx=(2, 10))
+        
+        ttk.Label(search_replace_frame, text="置換:").pack(side=tk.LEFT)
+        self.replace_var = tk.StringVar()
+        self.replace_entry = ttk.Entry(search_replace_frame, textvariable=self.replace_var, width=15)
+        self.replace_entry.pack(side=tk.LEFT, padx=(2, 10))
+        
+        ttk.Button(search_replace_frame, text="次を検索", command=self.find_next).pack(side=tk.LEFT, padx=2)
+        ttk.Button(search_replace_frame, text="置換して次へ", command=self.replace_current).pack(side=tk.LEFT, padx=2)
+        ttk.Button(search_replace_frame, text="すべて置換", command=self.replace_all).pack(side=tk.LEFT, padx=2)
+        
+        self.search_pos = "1.0"
+        self.last_search_query = ""
+        self.predefined_lyrics_text.tag_config('search', background='yellow', foreground='black')
+        
+        def on_ctrl_f(event):
+            try:
+                selected_text = event.widget.selection_get()
+                if selected_text:
+                    self.search_var.set(selected_text)
+            except tk.TclError:
+                pass
+            self.search_entry.focus_set()
+            return "break"
+            
+        self.predefined_lyrics_text.bind("<Control-f>", on_ctrl_f)
+        self.vocaloid_lyrics_text.bind("<Control-f>", on_ctrl_f)
+        self.search_entry.bind("<Return>", lambda e: self.find_next())
         
         # --- 追加パラメータ（詳細設定予定） ---
         advanced_frame = ttk.LabelFrame(frame, text="詳細設定", padding="5")
@@ -2656,23 +2696,109 @@ class OToVoApp:
         self._preview_after_id = self.root.after(100, self.update_vocaloid_preview)
         
     def update_vocaloid_preview(self, *args):
-        self.vocaloid_lyrics_text.config(state='normal')
-        self.vocaloid_lyrics_text.delete("1.0", tk.END)
-        
-        if not self.use_predefined_lyrics_var.get():
+        self._is_updating_preview = True
+        try:
+            scroll_y = self.predefined_lyrics_text.yview()
+            self.vocaloid_lyrics_text.config(state='normal')
+            self.vocaloid_lyrics_text.delete("1.0", tk.END)
+            
+            if not self.use_predefined_lyrics_var.get():
+                self.vocaloid_lyrics_text.config(state='disabled')
+                return
+                
+            text = self.predefined_lyrics_text.get("1.0", tk.END).strip()
+            
+            if self.convert_to_vocaloid_var.get() and text:
+                preview_text = get_vocaloid_preview_text(text)
+                self.vocaloid_lyrics_text.insert(tk.END, preview_text)
+            elif text:
+                # 変換しない場合もスペース・改行を維持してそのまま表示する
+                self.vocaloid_lyrics_text.insert(tk.END, text)
+                
             self.vocaloid_lyrics_text.config(state='disabled')
+            self.vocaloid_lyrics_text.yview_moveto(scroll_y[0])
+        finally:
+            self._is_updating_preview = False
+
+    def find_next(self):
+        query = self.search_var.get()
+        if not query:
             return
             
-        text = self.predefined_lyrics_text.get("1.0", tk.END).strip()
-        
-        if self.convert_to_vocaloid_var.get() and text:
-            preview_text = get_vocaloid_preview_text(text)
-            self.vocaloid_lyrics_text.insert(tk.END, preview_text)
-        elif text:
-            # 変換しない場合もスペース・改行を維持してそのまま表示する
-            self.vocaloid_lyrics_text.insert(tk.END, text)
+        if query != self.last_search_query:
+            self.search_pos = "1.0"
+            self.last_search_query = query
             
-        self.vocaloid_lyrics_text.config(state='disabled')
+        self.predefined_lyrics_text.tag_remove('search', "1.0", tk.END)
+        
+        idx = self.predefined_lyrics_text.search(query, self.search_pos, stopindex=tk.END)
+        if not idx:
+            idx = self.predefined_lyrics_text.search(query, "1.0", stopindex=tk.END)
+            if not idx:
+                messagebox.showinfo("検索", f"「{query}」は見つかりませんでした。")
+                return
+                
+        end_idx = f"{idx}+{len(query)}c"
+        self.predefined_lyrics_text.tag_add('search', idx, end_idx)
+        self.predefined_lyrics_text.see(idx)
+        self.search_pos = end_idx
+
+    def replace_current(self):
+        query = self.search_var.get()
+        repl = self.replace_var.get()
+        if not query:
+            return
+            
+        ranges = self.predefined_lyrics_text.tag_ranges('search')
+        if ranges:
+            start_idx = ranges[0]
+            end_idx = ranges[1]
+            if self.predefined_lyrics_text.get(start_idx, end_idx) == query:
+                self.predefined_lyrics_text.configure(autoseparators=False)
+                self.predefined_lyrics_text.edit_separator()
+                
+                self.predefined_lyrics_text.delete(start_idx, end_idx)
+                self.predefined_lyrics_text.insert(start_idx, repl)
+                
+                self.predefined_lyrics_text.edit_separator()
+                self.predefined_lyrics_text.configure(autoseparators=True)
+                
+                self.update_vocaloid_preview_delayed()
+                
+                self.search_pos = f"{start_idx}+{len(repl)}c"
+                self.find_next()
+        else:
+            self.find_next()
+
+    def replace_all(self):
+        query = self.search_var.get()
+        repl = self.replace_var.get()
+        if not query:
+            return
+            
+        self.predefined_lyrics_text.configure(autoseparators=False)
+        self.predefined_lyrics_text.edit_separator()
+        
+        count = 0
+        idx = "1.0"
+        while True:
+            idx = self.predefined_lyrics_text.search(query, idx, stopindex=tk.END)
+            if not idx:
+                break
+            end_idx = f"{idx}+{len(query)}c"
+            self.predefined_lyrics_text.delete(idx, end_idx)
+            self.predefined_lyrics_text.insert(idx, repl)
+            idx = f"{idx}+{len(repl)}c"
+            count += 1
+            
+        self.predefined_lyrics_text.edit_separator()
+        self.predefined_lyrics_text.configure(autoseparators=True)
+            
+        if count > 0:
+            self.update_vocaloid_preview_delayed()
+            messagebox.showinfo("置換完了", f"{count} 箇所を置換しました。")
+        else:
+            messagebox.showinfo("置換", f"「{query}」は見つかりませんでした。")
 
     def on_model_select(self, event):
         cb = event.widget
