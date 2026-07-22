@@ -2073,7 +2073,7 @@ def run_conversion(audio_file, output_base_path, user_specified_tempo, min_durat
                    unvoiced_threshold_frames=10, frame_period=10.0, low_pitch_threshold=47, low_pitch_drop_amount=18, top_db=40, skip_b_cost=0.5, last_mora_ratio=0.7,
                    whisper_model_name="large-v3", w2v2_model_name="vumichien/wav2vec2-large-xlsr-japanese-hiragana", f0_model="PyWorld",
                    output_formats=None, pyworld_silence_threshold=-40.0, pitch_split_threshold_ms=100.0, pitch_split_fluctuation=0.2, absorb_max_ms=100.0, enable_pitch_split=False,
-                   predefined_lyrics=None, convert_to_vocaloid=False, extract_vocals=False):
+                   predefined_lyrics=None, convert_to_vocaloid=False, extract_vocals=False, transpose=0):
     if output_formats is None:
         output_formats = ["ust"]
     pitch_split_threshold_frames = max(1, int(pitch_split_threshold_ms / frame_period))
@@ -2416,6 +2416,7 @@ class OToVoApp:
         self.fmt_midi_var = tk.BooleanVar(value=True)
         
         self.extract_vocals_var = tk.BooleanVar(value=False)
+        self.transpose_var = tk.IntVar(value=0)
         
         self.use_predefined_lyrics_var = tk.BooleanVar(value=False)
         self.convert_to_vocaloid_var = tk.BooleanVar(value=False)
@@ -2425,6 +2426,108 @@ class OToVoApp:
         # 標準出力と標準エラー出力をテキストボックスにリダイレクト
         sys.stdout = ThreadSafeTextRedirector(self.log_text)
         sys.stderr = ThreadSafeTextRedirector(self.log_text)
+        
+        self.load_settings()
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+    def load_settings(self):
+        import json, os
+        if os.path.exists('settings.json'):
+            try:
+                with open('settings.json', 'r', encoding='utf-8') as f:
+                    settings = json.load(f)
+                    
+                if 'audio_file_path' in settings: self.audio_file_path.set(settings['audio_file_path'])
+                if 'output_base_path' in settings: self.output_base_path_var.set(settings['output_base_path'])
+                if 'tempo' in settings: self.tempo_var.set(settings['tempo'])
+                if 'min_duration' in settings: self.min_duration_var.set(settings['min_duration'])
+                if 'unvoiced_threshold' in settings: self.unvoiced_threshold_var.set(settings['unvoiced_threshold'])
+                if 'frame_period' in settings: self.frame_period_var.set(settings['frame_period'])
+                if 'low_pitch_threshold' in settings: self.low_pitch_threshold_var.set(settings['low_pitch_threshold'])
+                if 'low_pitch_drop_amount' in settings: self.low_pitch_drop_amount_var.set(settings['low_pitch_drop_amount'])
+                if 'top_db' in settings: self.top_db_var.set(settings['top_db'])
+                if 'pyworld_silence_threshold' in settings: self.pyworld_silence_threshold_var.set(settings['pyworld_silence_threshold'])
+                if 'pitch_split_threshold_ms' in settings: self.pitch_split_threshold_ms_var.set(settings['pitch_split_threshold_ms'])
+                if 'pitch_split_fluctuation' in settings: self.pitch_split_fluctuation_var.set(settings['pitch_split_fluctuation'])
+                if 'absorb_max_ms' in settings: self.absorb_max_ms_var.set(settings['absorb_max_ms'])
+                if 'enable_pitch_split' in settings: self.enable_pitch_split_var.set(settings['enable_pitch_split'])
+                if 'skip_b_cost' in settings: self.skip_b_cost_var.set(settings['skip_b_cost'])
+                if 'last_mora_ratio' in settings: self.last_mora_ratio_var.set(settings['last_mora_ratio'])
+                if 'whisper_model' in settings: self.whisper_model_var.set(settings['whisper_model'])
+                if 'w2v2_model' in settings: self.w2v2_model_var.set(settings['w2v2_model'])
+                if 'f0_model' in settings: self.f0_model_var.set(settings['f0_model'])
+                
+                if 'export_hybrid' in settings: self.export_hybrid_var.set(settings['export_hybrid'])
+                if 'export_w2v2' in settings: self.export_w2v2_var.set(settings['export_w2v2'])
+                if 'export_whisper' in settings: self.export_whisper_var.set(settings['export_whisper'])
+                
+                if 'fmt_ust' in settings: self.fmt_ust_var.set(settings['fmt_ust'])
+                if 'fmt_musicxml' in settings: self.fmt_musicxml_var.set(settings['fmt_musicxml'])
+                if 'fmt_svp' in settings: self.fmt_svp_var.set(settings['fmt_svp'])
+                if 'fmt_vsqx' in settings: self.fmt_vsqx_var.set(settings['fmt_vsqx'])
+                if 'fmt_ccs' in settings: self.fmt_ccs_var.set(settings['fmt_ccs'])
+                if 'fmt_tssln' in settings: self.fmt_tssln_var.set(settings['fmt_tssln'])
+                if 'fmt_midi' in settings: self.fmt_midi_var.set(settings['fmt_midi'])
+                
+                if 'extract_vocals' in settings: self.extract_vocals_var.set(settings['extract_vocals'])
+                if 'transpose' in settings: self.transpose_var.set(settings['transpose'])
+                
+                if 'use_predefined_lyrics' in settings: self.use_predefined_lyrics_var.set(settings['use_predefined_lyrics'])
+                if 'convert_to_vocaloid' in settings: self.convert_to_vocaloid_var.set(settings['convert_to_vocaloid'])
+                
+                if 'predefined_lyrics' in settings and settings['predefined_lyrics']:
+                    self.predefined_lyrics_text.configure(state='normal')
+                    self.predefined_lyrics_text.delete(1.0, tk.END)
+                    self.predefined_lyrics_text.insert(tk.END, settings['predefined_lyrics'])
+                    if not self.use_predefined_lyrics_var.get():
+                        self.predefined_lyrics_text.configure(state='disabled')
+            except Exception as e:
+                print(f"Failed to load settings: {e}")
+
+    def on_closing(self):
+        import json
+        settings = {
+            'audio_file_path': self.audio_file_path.get(),
+            'output_base_path': self.output_base_path_var.get(),
+            'tempo': self.tempo_var.get(),
+            'min_duration': self.min_duration_var.get(),
+            'unvoiced_threshold': self.unvoiced_threshold_var.get(),
+            'frame_period': self.frame_period_var.get(),
+            'low_pitch_threshold': self.low_pitch_threshold_var.get(),
+            'low_pitch_drop_amount': self.low_pitch_drop_amount_var.get(),
+            'top_db': self.top_db_var.get(),
+            'pyworld_silence_threshold': self.pyworld_silence_threshold_var.get(),
+            'pitch_split_threshold_ms': self.pitch_split_threshold_ms_var.get(),
+            'pitch_split_fluctuation': self.pitch_split_fluctuation_var.get(),
+            'absorb_max_ms': self.absorb_max_ms_var.get(),
+            'enable_pitch_split': self.enable_pitch_split_var.get(),
+            'skip_b_cost': self.skip_b_cost_var.get(),
+            'last_mora_ratio': self.last_mora_ratio_var.get(),
+            'whisper_model': self.whisper_model_var.get(),
+            'w2v2_model': self.w2v2_model_var.get(),
+            'f0_model': self.f0_model_var.get(),
+            'export_hybrid': self.export_hybrid_var.get(),
+            'export_w2v2': self.export_w2v2_var.get(),
+            'export_whisper': self.export_whisper_var.get(),
+            'fmt_ust': self.fmt_ust_var.get(),
+            'fmt_musicxml': self.fmt_musicxml_var.get(),
+            'fmt_svp': self.fmt_svp_var.get(),
+            'fmt_vsqx': self.fmt_vsqx_var.get(),
+            'fmt_ccs': self.fmt_ccs_var.get(),
+            'fmt_tssln': self.fmt_tssln_var.get(),
+            'fmt_midi': self.fmt_midi_var.get(),
+            'extract_vocals': self.extract_vocals_var.get(),
+            'transpose': self.transpose_var.get(),
+            'use_predefined_lyrics': self.use_predefined_lyrics_var.get(),
+            'convert_to_vocaloid': self.convert_to_vocaloid_var.get(),
+            'predefined_lyrics': self.predefined_lyrics_text.get("1.0", tk.END).strip()
+        }
+        try:
+            with open('settings.json', 'w', encoding='utf-8') as f:
+                json.dump(settings, f, ensure_ascii=False, indent=4)
+        except Exception as e:
+            print(f"Failed to save settings: {e}")
+        self.root.destroy()
 
     def create_widgets(self):
         # 1. Main Vertical PanedWindow
@@ -2515,6 +2618,20 @@ class OToVoApp:
         
         ttk.Label(options_frame, text="BPM (空欄で自動推定):").grid(row=0, column=0, sticky=tk.W, pady=2)
         ttk.Entry(options_frame, textvariable=self.tempo_var, width=10).grid(row=0, column=1, sticky=tk.W, padx=5, pady=2)
+        
+        # トランスポーズ設定
+        ttk.Label(options_frame, text="トランスポーズ (半音):").grid(row=1, column=0, sticky=tk.W, pady=2)
+        
+        transpose_ctrl_frame = ttk.Frame(options_frame)
+        transpose_ctrl_frame.grid(row=1, column=1, columnspan=2, sticky=tk.W, pady=2)
+        
+        ttk.Button(transpose_ctrl_frame, text="-12", width=3, command=lambda: self.transpose_var.set(self.transpose_var.get() - 12)).pack(side=tk.LEFT, padx=1)
+        ttk.Button(transpose_ctrl_frame, text="-1", width=3, command=lambda: self.transpose_var.set(self.transpose_var.get() - 1)).pack(side=tk.LEFT, padx=1)
+        
+        ttk.Entry(transpose_ctrl_frame, textvariable=self.transpose_var, width=5, justify='center').pack(side=tk.LEFT, padx=2)
+        
+        ttk.Button(transpose_ctrl_frame, text="+1", width=3, command=lambda: self.transpose_var.set(self.transpose_var.get() + 1)).pack(side=tk.LEFT, padx=1)
+        ttk.Button(transpose_ctrl_frame, text="+12", width=3, command=lambda: self.transpose_var.set(self.transpose_var.get() + 12)).pack(side=tk.LEFT, padx=1)
         
         # 事前入力歌詞
         lyrics_frame = ttk.LabelFrame(frame, text="歌詞", padding="5")
@@ -2920,6 +3037,7 @@ class OToVoApp:
             return
             
         extract_vocals = self.extract_vocals_var.get()
+        transpose = self.transpose_var.get()
             
         whisper_model_name = self.whisper_model_var.get().strip()
         w2v2_model_name = self.w2v2_model_var.get().strip()
@@ -2973,18 +3091,18 @@ class OToVoApp:
         # 別スレッドで処理を実行（GUIのフリーズ防止）
         threading.Thread(target=self.run_conversion_thread, args=(audio_file, output_base, user_tempo, min_duration, export_hybrid, export_w2v2, export_whisper,
                                                                    unvoiced_threshold_frames, frame_period, low_pitch_threshold, low_pitch_drop_amount, top_db, skip_b_cost, last_mora_ratio,
-                                                                   whisper_model_name, w2v2_model_name, f0_model, output_formats, pyworld_silence_threshold, pitch_split_threshold_ms, pitch_split_fluctuation, absorb_max_ms, enable_pitch_split, predefined_lyrics, convert_to_vocaloid, extract_vocals), daemon=True).start()
+                                                                   whisper_model_name, w2v2_model_name, f0_model, output_formats, pyworld_silence_threshold, pitch_split_threshold_ms, pitch_split_fluctuation, absorb_max_ms, enable_pitch_split, predefined_lyrics, convert_to_vocaloid, extract_vocals, transpose), daemon=True).start()
 
     def run_conversion_thread(self, audio_file, output_base, user_tempo, min_duration, export_hybrid, export_w2v2, export_whisper,
                               unvoiced_threshold_frames, frame_period, low_pitch_threshold, low_pitch_drop_amount, top_db, skip_b_cost, last_mora_ratio,
-                              whisper_model_name, w2v2_model_name, f0_model, output_formats, pyworld_silence_threshold, pitch_split_threshold_ms, pitch_split_fluctuation, absorb_max_ms, enable_pitch_split, predefined_lyrics, convert_to_vocaloid, extract_vocals):
+                              whisper_model_name, w2v2_model_name, f0_model, output_formats, pyworld_silence_threshold, pitch_split_threshold_ms, pitch_split_fluctuation, absorb_max_ms, enable_pitch_split, predefined_lyrics, convert_to_vocaloid, extract_vocals, transpose):
         try:
             run_conversion(audio_file, output_base, user_tempo, min_duration, export_hybrid, export_w2v2, export_whisper,
                            unvoiced_threshold_frames=unvoiced_threshold_frames, frame_period=frame_period,
                            low_pitch_threshold=low_pitch_threshold, low_pitch_drop_amount=low_pitch_drop_amount,
                            top_db=top_db, skip_b_cost=skip_b_cost, last_mora_ratio=last_mora_ratio,
                            whisper_model_name=whisper_model_name, w2v2_model_name=w2v2_model_name, f0_model=f0_model,
-                           output_formats=output_formats, pyworld_silence_threshold=pyworld_silence_threshold, pitch_split_threshold_ms=pitch_split_threshold_ms, pitch_split_fluctuation=pitch_split_fluctuation, absorb_max_ms=absorb_max_ms, enable_pitch_split=enable_pitch_split, predefined_lyrics=predefined_lyrics, convert_to_vocaloid=convert_to_vocaloid, extract_vocals=extract_vocals)
+                           output_formats=output_formats, pyworld_silence_threshold=pyworld_silence_threshold, pitch_split_threshold_ms=pitch_split_threshold_ms, pitch_split_fluctuation=pitch_split_fluctuation, absorb_max_ms=absorb_max_ms, enable_pitch_split=enable_pitch_split, predefined_lyrics=predefined_lyrics, convert_to_vocaloid=convert_to_vocaloid, extract_vocals=extract_vocals, transpose=transpose)
         except Exception as e:
             import traceback
             print(f"\nエラーが発生しました:\n{traceback.format_exc()}")
