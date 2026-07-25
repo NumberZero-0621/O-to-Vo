@@ -2,6 +2,7 @@ import os
 import warnings
 import sys
 import threading
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext
 from tkinter import ttk
@@ -671,6 +672,51 @@ def get_pitch_contour(audio_path, frame_period=10.0, f0_model="PyWorld", pyworld
     
     return time, midi_contour, confidence
 
+def compute_global_dynamics(audio_path, sensitivity=100.0, min_volume_ratio=0.2):
+    sr, audio = wavfile.read(audio_path)
+    if len(audio.shape) > 1:
+        audio = np.mean(audio, axis=1)
+        
+    audio_f32 = audio.astype(np.float32)
+    if audio.dtype == np.int16:
+        audio_f32 /= 32768.0
+    elif audio.dtype == np.int32:
+        audio_f32 /= 2147483648.0
+        
+    hop_length = max(64, int(sr * 0.005))
+    frame_length = hop_length * 4
+    
+    rms = librosa.feature.rms(y=audio_f32, frame_length=frame_length, hop_length=hop_length)[0]
+    
+    db = librosa.amplitude_to_db(rms, ref=np.max)
+    db_max = np.max(db)
+    
+    active_mask = db > -45.0
+    if np.any(active_mask):
+        center_db = np.mean(db[active_mask])
+    else:
+        center_db = -12.0
+        
+    range_db = max(6.0, float(db_max - center_db))
+    
+    norm_vol = 0.5 + 0.5 * (db - center_db) / range_db
+    
+    sens_factor = max(0.0, min(100.0, float(sensitivity))) / 100.0
+    sens_vol = 0.5 + (norm_vol - 0.5) * sens_factor
+    
+    final_vol = np.clip(sens_vol, min_volume_ratio, 1.0)
+    
+    rms_times = librosa.frames_to_time(np.arange(len(final_vol)), sr=sr, hop_length=hop_length)
+    
+    return rms_times, final_vol
+
+def get_volume_contour(audio_path, time_array, sensitivity=100.0, min_volume_ratio=0.2):
+    rms_times, final_vol = compute_global_dynamics(audio_path, sensitivity, min_volume_ratio)
+    if len(rms_times) > 1:
+        return np.interp(time_array, rms_times, final_vol)
+    else:
+        return np.full_like(time_array, final_vol[0] if len(final_vol)>0 else 0.5)
+
 # ==========================================
 # DPを用いたWhisperXとWav2Vec2の歌詞マッピング
 # ==========================================
@@ -783,7 +829,7 @@ def align_lyrics_to_timings(whisper_chars, w2v2_chars, skip_b_cost=0.5, last_mor
 # ==========================================
 # 3. ノートの分割と文字の割り当て（ハイブリッド処理）
 # ==========================================
-def segment_and_align_notes(char_segments, time_array, midi_contour, confidence_array, min_duration=0.03, unvoiced_threshold_frames=10, low_pitch_threshold=47, low_pitch_drop_amount=18, pitch_split_threshold_frames=10, pitch_split_fluctuation=0.2, absorb_max_frames=10, enable_pitch_split=False):
+def segment_and_align_notes(char_segments, time_array, midi_contour, confidence_array, min_duration=0.03, unvoiced_threshold_frames=10, low_pitch_threshold=47, low_pitch_drop_amount=18, pitch_split_threshold_frames=10, pitch_split_fluctuation=0.2, absorb_max_frames=10, enable_pitch_split=False, volume_contour=None):
     # print("統合タイムライン方式によるノート生成を実行中...")
     
     if len(time_array) == 0:
@@ -957,6 +1003,9 @@ def segment_and_align_notes(char_segments, time_array, midi_contour, confidence_
                 note_pitch = current_midi
                 
             final_pitch_curve = []
+            final_volume_curve = []
+            note_volume = 0.5
+            
             if current_info and len(segment_pitches) > 0:
                 curve = segment_pitches.copy()
                 valid_mask = ~np.isnan(curve)
@@ -968,12 +1017,20 @@ def segment_and_align_notes(char_segments, time_array, midi_contour, confidence_
                         curve[valid_mask] = note_pitch + (deviations * scale_factor)
                 final_pitch_curve = curve.tolist()
                 
+                if volume_contour is not None:
+                    segment_volumes = volume_contour[start_frame:i]
+                    final_volume_curve = segment_volumes.tolist()
+                    if len(segment_volumes) > 0:
+                        note_volume = float(np.mean(segment_volumes))
+                
             raw_notes.append({
                 "lyric": current_info["text"] if current_info else "R",
                 "start": current_start,
                 "end": time_array[i],
                 "pitch": note_pitch if current_info else 60,
-                "pitch_curve": final_pitch_curve
+                "pitch_curve": final_pitch_curve,
+                "volume": note_volume,
+                "volume_curve": final_volume_curve
             })
             current_info = this_info
             current_midi = note_pitch # 次の区間のデフォルトピッチとして更新
@@ -996,6 +1053,9 @@ def segment_and_align_notes(char_segments, time_array, midi_contour, confidence_
         note_pitch = current_midi
 
     final_pitch_curve = []
+    final_volume_curve = []
+    note_volume = 0.5
+    
     if current_info and len(segment_pitches) > 0:
         curve = segment_pitches.copy()
         valid_mask = ~np.isnan(curve)
@@ -1006,13 +1066,21 @@ def segment_and_align_notes(char_segments, time_array, midi_contour, confidence_
                 scale_factor = 7.0 / max_abs_dev
                 curve[valid_mask] = note_pitch + (deviations * scale_factor)
         final_pitch_curve = curve.tolist()
+        
+        if volume_contour is not None:
+            segment_volumes = volume_contour[start_frame:]
+            final_volume_curve = segment_volumes.tolist()
+            if len(segment_volumes) > 0:
+                note_volume = float(np.mean(segment_volumes))
 
     raw_notes.append({
         "lyric": current_info["text"] if current_info else "R",
         "start": current_start,
         "end": time_array[-1],
         "pitch": note_pitch if current_info else 60,
-        "pitch_curve": final_pitch_curve
+        "pitch_curve": final_pitch_curve,
+        "volume": note_volume,
+        "volume_curve": final_volume_curve
     })
 
     # 短いノートの統合（ノイズ除去）は撤廃し、すべてのノートをそのまま出力する
@@ -1029,7 +1097,9 @@ def segment_and_align_notes(char_segments, time_array, midi_contour, confidence_
             "start": note["start"],
             "end": note["end"],
             "pitch": note["pitch"],
-            "pitch_curve": note.get("pitch_curve", [])
+            "pitch_curve": note.get("pitch_curve", []),
+            "volume": note.get("volume", 0.5),
+            "volume_curve": note.get("volume_curve", [])
         })
         
     # 4. 極端な低音ノイズの削除（休符化）
@@ -1128,6 +1198,9 @@ def export_to_ust(ust_notes, output_path, tempo=170):
                 f.write(f"Length={length_ticks}\n")
                 f.write(f"Lyric={lyric}\n")
                 f.write(f"NoteNum={note['pitch']}\n")
+                if "volume" in note:
+                    intensity = max(0, min(200, int(note["volume"] * 200)))
+                    f.write(f"Intensity={intensity}\n")
                 f.write("PreUtterance=0\n")
                 f.write("VoiceOverlap=0\n")
                 
@@ -1326,7 +1399,8 @@ def export_to_musicxml(ust_notes, output_path, tempo=170):
                         "start": sub_note["start_tick"],
                         "end": sub_note["end_tick"],
                         "pitch": sub_note["pitch"],
-                        "text": sub_note["text"]
+                        "text": sub_note["text"],
+                        "volume": note.get("volume", 0.5)
                     })
         current_tick = end_tick
         
@@ -1360,6 +1434,7 @@ def export_to_musicxml(ust_notes, output_path, tempo=170):
             if event["type"] == "note":
                 chunk["pitch"] = event["pitch"]
                 chunk["text"] = event["text"]
+                chunk["volume"] = event.get("volume", 0.5)
                 
             measures[measure_idx].append(chunk)
             start = chunk_end
@@ -1401,6 +1476,12 @@ def export_to_musicxml(ust_notes, output_path, tempo=170):
         measure_events = measures.get(m, [])
         current_measure_tick = 0
         for chunk in measure_events:
+            if chunk["type"] == "note" and chunk["is_start"] and "volume" in chunk:
+                dyn_val = max(0, min(140, int(chunk["volume"] * 140)))
+                xml_str.append('      <direction placement="below">')
+                xml_str.append(f'        <sound dynamics="{dyn_val}"/>')
+                xml_str.append('      </direction>')
+                
             xml_str.append('      <note>')
             if chunk["type"] == "rest":
                 xml_str.append('        <rest/>')
@@ -1502,11 +1583,14 @@ def export_to_midi(ust_notes, output_path, tempo=170):
             sub_notes = quantize_pitch_curve_to_notes(
                 note.get("pitch_curve", []), note["pitch"], start_tick, end_tick, ""
             )
+            note_vol = note.get("volume", 0.787)
+            velocity = max(1, min(127, int(note_vol * 127)))
+            
             for sub_note in sub_notes:
                 p = sub_note["pitch"]
                 p = max(0, min(127, int(p)))
-                events.append((sub_note["start_tick"], 'note_on', p))
-                events.append((sub_note["end_tick"], 'note_off', p))
+                events.append((sub_note["start_tick"], 'note_on', p, velocity))
+                events.append((sub_note["end_tick"], 'note_off', p, 0))
                 
     mpqn = int(60000000 / tempo)
     events.append((0, 'tempo', mpqn))
@@ -1526,7 +1610,7 @@ def export_to_midi(ust_notes, output_path, tempo=170):
             m = e[2]
             track_data.extend(bytes([0xFF, 0x51, 0x03, (m >> 16) & 0xFF, (m >> 8) & 0xFF, m & 0xFF]))
         elif e[1] == 'note_on':
-            track_data.extend(bytes([0x90, e[2], 100]))
+            track_data.extend(bytes([0x90, e[2], e[3]]))
         elif e[1] == 'note_off':
             track_data.extend(bytes([0x80, e[2], 0]))
             
@@ -1565,6 +1649,7 @@ def export_to_svp(ust_notes, output_path, tempo=170):
     
     svp_notes = []
     pitch_points = []
+    loudness_points = []
     
     for note in ust_notes:
         start_blick = int(round(note["start"] * blicks_per_second))
@@ -1610,6 +1695,14 @@ def export_to_svp(ust_notes, output_path, tempo=170):
                     delta_cents = (p - base_pitch) * 100
                     pitch_points.extend([pt_blick, float(delta_cents)])
                     
+        volume_curve = note.get("volume_curve", [])
+        if len(volume_curve) > 0:
+            total_vol_points = len(volume_curve)
+            for i, v in enumerate(volume_curve):
+                pt_blick = start_blick + int((i / total_vol_points) * duration_blick)
+                # Map 0.0~1.0 to -12.0~12.0 dB
+                loudness_points.extend([pt_blick, float((v * 24.0) - 12.0)])
+                    
     svp_data = {
         "version": 153,
         "time": {
@@ -1631,6 +1724,10 @@ def export_to_svp(ust_notes, output_path, tempo=170):
                         "pitchDelta": {
                             "mode": "cosine",
                             "points": pitch_points
+                        },
+                        "loudness": {
+                            "mode": "linear",
+                            "points": loudness_points
                         }
                     },
                     "notes": svp_notes
@@ -1772,11 +1869,12 @@ def export_to_vsqx(ust_notes, output_path, tempo=170):
     sub(vsTrack, "name", "Track 1", True)
     sub(vsTrack, "comment", "Track", True)
     
+    part_name = os.path.splitext(os.path.basename(output_path))[0] or "O-to-Vo Part"
     vsPart = sub(vsTrack, "vsPart")
     sub(vsPart, "t", "1920")
     playTime = sub(vsPart, "playTime", "0")
-    sub(vsPart, "name", "O-to-Vo Part", True)
-    sub(vsPart, "comment", "O-to-Vo Part", True)
+    sub(vsPart, "name", part_name, True)
+    sub(vsPart, "comment", part_name, True)
     
     sPlug = sub(vsPart, "sPlug")
     sub(sPlug, "id", "ACA9C502-A04B-42b5-B2EB-5CEA36D16FCE", True)
@@ -1799,6 +1897,7 @@ def export_to_vsqx(ust_notes, output_path, tempo=170):
     note_elements = []
     cc_s_events = {}
     cc_p_events = {}
+    cc_dyn_events = {}
     
     for note in ust_notes:
         start_tick = int(round(note["start"] * ticks_per_second))
@@ -1861,6 +1960,14 @@ def export_to_vsqx(ust_notes, output_path, tempo=170):
                 
                 # ノート終了時にピッチベンドをリセット（次のノートへの影響を防ぐ）
                 cc_p_events[end_tick] = 0
+            
+        volume_curve = note.get("volume_curve", [])
+        if len(volume_curve) > 0:
+            total_vol_points = len(volume_curve)
+            for i, v in enumerate(volume_curve):
+                pt_tick = start_tick + int((i / total_vol_points) * dur_tick)
+                dyn_val = max(0, min(127, int(v * 127)))
+                cc_dyn_events[pt_tick] = dyn_val
 
     # 重複を排除し、時刻順かつグループごとに要素を追加
     for t in sorted(cc_s_events.keys()):
@@ -1876,6 +1983,13 @@ def export_to_vsqx(ust_notes, output_path, tempo=170):
         elem = sub(cc_p, "v", str(cc_p_events[t]))
         elem.set("id", "P")
         vsPart.append(cc_p)
+        
+    for t in sorted(cc_dyn_events.keys()):
+        cc_d = ET.Element("cc")
+        sub(cc_d, "t", t)
+        elem = sub(cc_d, "v", str(cc_dyn_events[t]))
+        elem.set("id", "D")
+        vsPart.append(cc_d)
 
     note_elements.sort(key=lambda x: int(x.find("t").text))
     for note_elem in note_elements:
@@ -1953,6 +2067,8 @@ def export_to_ccs(ust_notes, output_path, tempo=170):
     param = sub(song, "Parameter")
     logf0_elem = sub(param, "LogF0")
     logf0_data = {}
+    vol_elem = sub(param, "VOL")
+    vol_data = {}
 
     for note in ust_notes:
         start_tick = int(round(note["start"] * ticks_per_second))
@@ -1995,6 +2111,15 @@ def export_to_ccs(ust_notes, output_path, tempo=170):
                     f0_hz = 440.0 * (2.0 ** ((p - 69.0) / 12.0))
                     if f0_hz > 0:
                         logf0_data[frame_idx] = math.log(f0_hz)
+                        
+        volume_curve = note.get("volume_curve", [])
+        if len(volume_curve) > 0:
+            total_vol_points = len(volume_curve)
+            for i, v in enumerate(volume_curve):
+                time_sec = note["start"] + (i / total_vol_points) * (note["end"] - note["start"])
+                frame_idx = int(round(time_sec / frame_period))
+                # Map 0.0~1.0 to -127~127
+                vol_data[frame_idx] = int(max(-127, min(127, (v * 254) - 127)))
 
     if logf0_data:
         max_idx = max(logf0_data.keys())
@@ -2008,6 +2133,20 @@ def export_to_ccs(ust_notes, output_path, tempo=170):
                 sub(logf0_elem, "Data", text=str(val))
             else:
                 sub(logf0_elem, "Data", text=str(val), Index=str(idx))
+            last_idx = idx
+
+    if vol_data:
+        max_idx = max(vol_data.keys())
+        vol_elem.set("Length", str(max_idx + 1))
+        
+        sorted_indices = sorted(vol_data.keys())
+        last_idx = -2
+        for idx in sorted_indices:
+            val = vol_data[idx]
+            if idx == last_idx + 1:
+                sub(vol_elem, "Data", text=str(val))
+            else:
+                sub(vol_elem, "Data", text=str(val), Index=str(idx))
             last_idx = idx
 
     groups = sub(scene, "Groups")
@@ -2073,7 +2212,7 @@ def run_conversion(audio_file, output_base_path, user_specified_tempo, min_durat
                    unvoiced_threshold_frames=10, frame_period=10.0, low_pitch_threshold=47, low_pitch_drop_amount=18, top_db=40, skip_b_cost=0.5, last_mora_ratio=0.7,
                    whisper_model_name="large-v3", w2v2_model_name="vumichien/wav2vec2-large-xlsr-japanese-hiragana", f0_model="PyWorld",
                    output_formats=None, pyworld_silence_threshold=-40.0, pitch_split_threshold_ms=100.0, pitch_split_fluctuation=0.2, absorb_max_ms=100.0, enable_pitch_split=False,
-                   predefined_lyrics=None, convert_to_vocaloid=False, extract_vocals=False, transpose=0):
+                   predefined_lyrics=None, convert_to_vocaloid=False, extract_vocals=False, transpose=0, reflect_dynamics=False, dynamics_sensitivity=100):
     if output_formats is None:
         output_formats = ["ust"]
     pitch_split_threshold_frames = max(1, int(pitch_split_threshold_ms / frame_period))
@@ -2211,6 +2350,11 @@ def run_conversion(audio_file, output_base_path, user_specified_tempo, min_durat
     all_final_notes_whisper = [] # Whisperデバッグ出力用
     print(f"全 {len(final_chunks)} チャンクに分割しました。処理を開始します...")
     
+    global_vol_times, global_vol_values = None, None
+    if reflect_dynamics:
+        print("音声全般のダイナミクス（音量推移）を解析中...")
+        global_vol_times, global_vol_values = compute_global_dynamics(process_audio_file, sensitivity=dynamics_sensitivity, min_volume_ratio=0.2)
+    
     remaining_lyrics = None
     if predefined_lyrics is not None:
         if convert_to_vocaloid:
@@ -2277,9 +2421,14 @@ def run_conversion(audio_file, output_base_path, user_specified_tempo, min_durat
             # aligned_w2v2_chars = refine_note_boundaries_with_dtw(char_segments_w2v2_aligned, time_array, confidence_array)
             aligned_w2v2_chars = char_segments_w2v2_aligned
             
+            # 2.6 ダイナミクスの取得
+            volume_contour = None
+            if reflect_dynamics and global_vol_times is not None and len(global_vol_times) > 0:
+                volume_contour = np.interp(time_array, global_vol_times, global_vol_values)
+                
             # 3. データの結合とノート化 (ハイブリッド出力用)
             # Wav2Vec2の正確なタイミングをベースに、隙間をピッチ追従の「ー」で埋める
-            final_notes = segment_and_align_notes(aligned_w2v2_chars, time_array, midi_contour, confidence_array, min_duration=min_duration, unvoiced_threshold_frames=unvoiced_threshold_frames, low_pitch_threshold=low_pitch_threshold, low_pitch_drop_amount=low_pitch_drop_amount, pitch_split_threshold_frames=pitch_split_threshold_frames, pitch_split_fluctuation=pitch_split_fluctuation, absorb_max_frames=absorb_max_frames, enable_pitch_split=enable_pitch_split)
+            final_notes = segment_and_align_notes(aligned_w2v2_chars, time_array, midi_contour, confidence_array, min_duration=min_duration, unvoiced_threshold_frames=unvoiced_threshold_frames, low_pitch_threshold=low_pitch_threshold, low_pitch_drop_amount=low_pitch_drop_amount, pitch_split_threshold_frames=pitch_split_threshold_frames, pitch_split_fluctuation=pitch_split_fluctuation, absorb_max_frames=absorb_max_frames, enable_pitch_split=enable_pitch_split, volume_contour=volume_contour)
             all_final_notes.extend(final_notes)
             
             # Whisperデバッグ用: is_skipped な文字を "R" (休符) に置き換える
@@ -2290,7 +2439,7 @@ def run_conversion(audio_file, output_base_path, user_specified_tempo, min_durat
                     new_seg["text"] = "R"
                 aligned_whisper_chars.append(new_seg)
             
-            final_notes_whisper = segment_and_align_notes(aligned_whisper_chars, time_array, midi_contour, confidence_array, min_duration=min_duration, unvoiced_threshold_frames=unvoiced_threshold_frames, low_pitch_threshold=low_pitch_threshold, low_pitch_drop_amount=low_pitch_drop_amount, pitch_split_threshold_frames=pitch_split_threshold_frames, pitch_split_fluctuation=pitch_split_fluctuation, absorb_max_frames=absorb_max_frames)
+            final_notes_whisper = segment_and_align_notes(aligned_whisper_chars, time_array, midi_contour, confidence_array, min_duration=min_duration, unvoiced_threshold_frames=unvoiced_threshold_frames, low_pitch_threshold=low_pitch_threshold, low_pitch_drop_amount=low_pitch_drop_amount, pitch_split_threshold_frames=pitch_split_threshold_frames, pitch_split_fluctuation=pitch_split_fluctuation, absorb_max_frames=absorb_max_frames, volume_contour=volume_contour)
             all_final_notes_whisper.extend(final_notes_whisper)
             
             # Wav2Vec2単独出力用のノートリスト構築
@@ -2319,6 +2468,18 @@ def run_conversion(audio_file, output_base_path, user_specified_tempo, min_durat
         torch.cuda.empty_cache()
     # 5. 各フォーマットでファイル出力
     def save_formats(notes_data, source_name):
+        if transpose != 0:
+            for note in notes_data:
+                note["pitch"] += transpose
+                if note.get("pitch_curve"):
+                    new_curve = []
+                    for p in note["pitch_curve"]:
+                        if p is None or (isinstance(p, (int, float)) and np.isnan(p)):
+                            new_curve.append(p)
+                        else:
+                            new_curve.append(p + transpose)
+                    note["pitch_curve"] = new_curve
+
         # Tick計算（UTAUやMusicXML共通）
         ticks_per_second = (target_tempo * 480) / 60
         for note in notes_data:
@@ -2395,6 +2556,8 @@ class OToVoApp:
         self.top_db_var = tk.StringVar(value="40")
         self.pyworld_silence_threshold_var = tk.StringVar(value="-40.0")
         self.pitch_split_threshold_ms_var = tk.StringVar(value="100")
+        self.reflect_dynamics_var = tk.BooleanVar(value=False)
+        self.dynamics_sensitivity_var = tk.IntVar(value=100)
         self.pitch_split_fluctuation_var = tk.StringVar(value="0.2")
         self.absorb_max_ms_var = tk.StringVar(value="100")
         self.enable_pitch_split_var = tk.BooleanVar(value=False)
@@ -2451,6 +2614,8 @@ class OToVoApp:
                 if 'pitch_split_fluctuation' in settings: self.pitch_split_fluctuation_var.set(settings['pitch_split_fluctuation'])
                 if 'absorb_max_ms' in settings: self.absorb_max_ms_var.set(settings['absorb_max_ms'])
                 if 'enable_pitch_split' in settings: self.enable_pitch_split_var.set(settings['enable_pitch_split'])
+                if 'reflect_dynamics' in settings: self.reflect_dynamics_var.set(settings['reflect_dynamics'])
+                if 'dynamics_sensitivity' in settings: self.dynamics_sensitivity_var.set(settings['dynamics_sensitivity'])
                 if 'skip_b_cost' in settings: self.skip_b_cost_var.set(settings['skip_b_cost'])
                 if 'last_mora_ratio' in settings: self.last_mora_ratio_var.set(settings['last_mora_ratio'])
                 if 'whisper_model' in settings: self.whisper_model_var.set(settings['whisper_model'])
@@ -2501,6 +2666,8 @@ class OToVoApp:
             'pitch_split_fluctuation': self.pitch_split_fluctuation_var.get(),
             'absorb_max_ms': self.absorb_max_ms_var.get(),
             'enable_pitch_split': self.enable_pitch_split_var.get(),
+            'reflect_dynamics': self.reflect_dynamics_var.get(),
+            'dynamics_sensitivity': self.dynamics_sensitivity_var.get(),
             'skip_b_cost': self.skip_b_cost_var.get(),
             'last_mora_ratio': self.last_mora_ratio_var.get(),
             'whisper_model': self.whisper_model_var.get(),
@@ -2633,6 +2800,13 @@ class OToVoApp:
         ttk.Button(transpose_ctrl_frame, text="+1", width=3, command=lambda: self.transpose_var.set(self.transpose_var.get() + 1)).pack(side=tk.LEFT, padx=1)
         ttk.Button(transpose_ctrl_frame, text="+12", width=3, command=lambda: self.transpose_var.set(self.transpose_var.get() + 12)).pack(side=tk.LEFT, padx=1)
         
+        # ダイナミクス設定
+        dyn_frame = ttk.Frame(options_frame)
+        dyn_frame.grid(row=2, column=0, columnspan=3, sticky=tk.W, pady=2)
+        ttk.Checkbutton(dyn_frame, text="ダイナミクス（音量）を反映させる", variable=self.reflect_dynamics_var).pack(side=tk.LEFT)
+        ttk.Label(dyn_frame, text=" 感度 (0-100):").pack(side=tk.LEFT, padx=(10, 2))
+        ttk.Spinbox(dyn_frame, from_=0, to=100, textvariable=self.dynamics_sensitivity_var, width=5).pack(side=tk.LEFT)
+        
         # 事前入力歌詞
         lyrics_frame = ttk.LabelFrame(frame, text="歌詞", padding="5")
         lyrics_frame.pack(fill=tk.X, pady=5)
@@ -2661,16 +2835,32 @@ class OToVoApp:
         self.vocaloid_lyrics_text.pack(fill=tk.BOTH, expand=True, padx=(2, 0))
         
         self._is_updating_preview = False
+        self._syncing_scroll = False
+        self._last_left_update_time = 0
+        self._last_preview_input_text = ""
         
         def sync_predefined(*args):
             self.predefined_lyrics_text.vbar.set(*args)
-            if not getattr(self, '_is_updating_preview', False):
-                self.vocaloid_lyrics_text.yview_moveto(args[0])
+            if not getattr(self, '_is_updating_preview', False) and not getattr(self, '_syncing_scroll', False):
+                self._syncing_scroll = True
+                self._last_left_update_time = time.time()
+                try:
+                    self.vocaloid_lyrics_text.yview_moveto(args[0])
+                    self.root.update_idletasks()
+                finally:
+                    self._syncing_scroll = False
             
         def sync_vocaloid(*args):
             self.vocaloid_lyrics_text.vbar.set(*args)
-            if not getattr(self, '_is_updating_preview', False):
-                self.predefined_lyrics_text.yview_moveto(args[0])
+            if not getattr(self, '_is_updating_preview', False) and not getattr(self, '_syncing_scroll', False):
+                if time.time() - getattr(self, '_last_left_update_time', 0) < 0.25:
+                    return
+                self._syncing_scroll = True
+                try:
+                    self.predefined_lyrics_text.yview_moveto(args[0])
+                    self.root.update_idletasks()
+                finally:
+                    self._syncing_scroll = False
             
         self.predefined_lyrics_text['yscrollcommand'] = sync_predefined
         self.vocaloid_lyrics_text['yscrollcommand'] = sync_vocaloid
@@ -2813,7 +3003,13 @@ class OToVoApp:
         self._preview_after_id = self.root.after(100, self.update_vocaloid_preview)
         
     def update_vocaloid_preview(self, *args):
+        text = self.predefined_lyrics_text.get("1.0", tk.END).strip()
+        if self.use_predefined_lyrics_var.get() and getattr(self, '_last_preview_input_text', None) == text:
+            return
+        self._last_preview_input_text = text if self.use_predefined_lyrics_var.get() else ""
+
         self._is_updating_preview = True
+        self._last_left_update_time = time.time()
         try:
             scroll_y = self.predefined_lyrics_text.yview()
             self.vocaloid_lyrics_text.config(state='normal')
@@ -2823,8 +3019,6 @@ class OToVoApp:
                 self.vocaloid_lyrics_text.config(state='disabled')
                 return
                 
-            text = self.predefined_lyrics_text.get("1.0", tk.END).strip()
-            
             if self.convert_to_vocaloid_var.get() and text:
                 preview_text = get_vocaloid_preview_text(text)
                 self.vocaloid_lyrics_text.insert(tk.END, preview_text)
@@ -2834,6 +3028,7 @@ class OToVoApp:
                 
             self.vocaloid_lyrics_text.config(state='disabled')
             self.vocaloid_lyrics_text.yview_moveto(scroll_y[0])
+            self.root.update_idletasks()
         finally:
             self._is_updating_preview = False
 
@@ -3038,6 +3233,11 @@ class OToVoApp:
             
         extract_vocals = self.extract_vocals_var.get()
         transpose = self.transpose_var.get()
+        reflect_dynamics = self.reflect_dynamics_var.get()
+        try:
+            dynamics_sensitivity = int(self.dynamics_sensitivity_var.get())
+        except ValueError:
+            dynamics_sensitivity = 100
             
         whisper_model_name = self.whisper_model_var.get().strip()
         w2v2_model_name = self.w2v2_model_var.get().strip()
@@ -3091,18 +3291,18 @@ class OToVoApp:
         # 別スレッドで処理を実行（GUIのフリーズ防止）
         threading.Thread(target=self.run_conversion_thread, args=(audio_file, output_base, user_tempo, min_duration, export_hybrid, export_w2v2, export_whisper,
                                                                    unvoiced_threshold_frames, frame_period, low_pitch_threshold, low_pitch_drop_amount, top_db, skip_b_cost, last_mora_ratio,
-                                                                   whisper_model_name, w2v2_model_name, f0_model, output_formats, pyworld_silence_threshold, pitch_split_threshold_ms, pitch_split_fluctuation, absorb_max_ms, enable_pitch_split, predefined_lyrics, convert_to_vocaloid, extract_vocals, transpose), daemon=True).start()
+                                                                   whisper_model_name, w2v2_model_name, f0_model, output_formats, pyworld_silence_threshold, pitch_split_threshold_ms, pitch_split_fluctuation, absorb_max_ms, enable_pitch_split, predefined_lyrics, convert_to_vocaloid, extract_vocals, transpose, reflect_dynamics, dynamics_sensitivity), daemon=True).start()
 
     def run_conversion_thread(self, audio_file, output_base, user_tempo, min_duration, export_hybrid, export_w2v2, export_whisper,
                               unvoiced_threshold_frames, frame_period, low_pitch_threshold, low_pitch_drop_amount, top_db, skip_b_cost, last_mora_ratio,
-                              whisper_model_name, w2v2_model_name, f0_model, output_formats, pyworld_silence_threshold, pitch_split_threshold_ms, pitch_split_fluctuation, absorb_max_ms, enable_pitch_split, predefined_lyrics, convert_to_vocaloid, extract_vocals, transpose):
+                              whisper_model_name, w2v2_model_name, f0_model, output_formats, pyworld_silence_threshold, pitch_split_threshold_ms, pitch_split_fluctuation, absorb_max_ms, enable_pitch_split, predefined_lyrics, convert_to_vocaloid, extract_vocals, transpose, reflect_dynamics, dynamics_sensitivity):
         try:
             run_conversion(audio_file, output_base, user_tempo, min_duration, export_hybrid, export_w2v2, export_whisper,
                            unvoiced_threshold_frames=unvoiced_threshold_frames, frame_period=frame_period,
                            low_pitch_threshold=low_pitch_threshold, low_pitch_drop_amount=low_pitch_drop_amount,
                            top_db=top_db, skip_b_cost=skip_b_cost, last_mora_ratio=last_mora_ratio,
                            whisper_model_name=whisper_model_name, w2v2_model_name=w2v2_model_name, f0_model=f0_model,
-                           output_formats=output_formats, pyworld_silence_threshold=pyworld_silence_threshold, pitch_split_threshold_ms=pitch_split_threshold_ms, pitch_split_fluctuation=pitch_split_fluctuation, absorb_max_ms=absorb_max_ms, enable_pitch_split=enable_pitch_split, predefined_lyrics=predefined_lyrics, convert_to_vocaloid=convert_to_vocaloid, extract_vocals=extract_vocals, transpose=transpose)
+                           output_formats=output_formats, pyworld_silence_threshold=pyworld_silence_threshold, pitch_split_threshold_ms=pitch_split_threshold_ms, pitch_split_fluctuation=pitch_split_fluctuation, absorb_max_ms=absorb_max_ms, enable_pitch_split=enable_pitch_split, predefined_lyrics=predefined_lyrics, convert_to_vocaloid=convert_to_vocaloid, extract_vocals=extract_vocals, transpose=transpose, reflect_dynamics=reflect_dynamics, dynamics_sensitivity=dynamics_sensitivity)
         except Exception as e:
             import traceback
             print(f"\nエラーが発生しました:\n{traceback.format_exc()}")
