@@ -1,0 +1,5 @@
+.venv
+output*
+vocal*
+dummy*
+settings.json
